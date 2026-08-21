@@ -1,0 +1,69 @@
+name = "PartialFSHT"
+uuid = "a5dab405-926d-40ae-b896-53ce7bb05d38"
+version = "0.1.0"
+authors = ["Jordan Benjamin <jordantbenjamin@gmail.com>"]
+
+[workspace]
+projects = ["test", "docs"]
+
+[deps]
+AbstractFFTs = "621f4979-c628-5d54-868e-fcf4e3e8185c"
+ComputationalBackends = "5c6e2104-4040-447f-8fc0-66ec2223b019"
+FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
+FastSphericalHarmonics = "d335c211-7587-445e-a753-f0b1fb7e445f"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
+
+[weakdeps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
+FINUFFT = "d8beea63-0952-562e-9c6a-8e8ef7364055"
+GPUArraysCore = "46192b85-c4d5-4398-a991-12ede77f4527"
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
+NUFSHT = "e99b67a3-9706-455a-90e2-85b195a33206"
+NonuniformFFTs = "cd96f58b-6017-4a02-bb9e-f4d81626177f"
+OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
+
+[sources]
+ComputationalBackends = {url = "https://github.com/jbphyswx/ComputationalBackends.jl.git"}
+NUFSHT = {url = "https://github.com/jbphyswx/NUFSHT.jl.git"}
+
+[extensions]
+PartialFSHTcuFINUFFTExt = ["CUDA", "FINUFFT"]
+PartialFSHTDistributedExt = "Distributed"
+PartialFSHTFINUFFTExt = "FINUFFT"
+PartialFSHTKernelAbstractionsExt = ["KernelAbstractions", "GPUArraysCore"]
+PartialFSHTMPIExt = "MPI"
+PartialFSHTNUFSHTExt = "NUFSHT"
+PartialFSHTNonuniformFFTsExt = "NonuniformFFTs"
+PartialFSHTOhMyThreadsExt = "OhMyThreads"
+
+[extras]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
+FINUFFT = "d8beea63-0952-562e-9c6a-8e8ef7364055"
+GPUArraysCore = "46192b85-c4d5-4398-a991-12ede77f4527"
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
+NUFSHT = "e99b67a3-9706-455a-90e2-85b195a33206"
+NonuniformFFTs = "cd96f58b-6017-4a02-bb9e-f4d81626177f"
+OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
+
+[compat]
+AbstractFFTs = "1"
+CUDA = "5, 6"
+ComputationalBackends = "0.1"
+Distributed = "1"
+FFTW = "1"
+FINUFFT = "3"
+FastSphericalHarmonics = "1"
+GPUArraysCore = "0.1, 0.2"
+KernelAbstractions = "0.9"
+LinearAlgebra = "1"
+MPI = "0.20"
+NUFSHT = "0.1"
+NonuniformFFTs = "0.9.6"
+OhMyThreads = "0.7, 0.8"
+SpecialFunctions = "2.8.0"
+julia = "1.11"

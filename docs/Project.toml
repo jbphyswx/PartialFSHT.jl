@@ -1,0 +1,10 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+PartialFSHT = "a5dab405-926d-40ae-b896-53ce7bb05d38"
+
+[sources]
+PartialFSHT = {path = ".."}
+
+[compat]
+Documenter = "1"
+julia = "1.11"
