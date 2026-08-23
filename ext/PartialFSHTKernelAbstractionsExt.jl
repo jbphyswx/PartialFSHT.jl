@@ -62,40 +62,4 @@ function PartialFSHT.dfs_fold!(F::GPUArraysCore.AbstractGPUArray, F̃::GPUArrays
     return F
 end
 
-@kernel function _scale_legendre_kern!(out, @Const(x), @Const(P), c)
-    i = @index(Global)
-    @inbounds out[i] = c * x[i] * P[i]
-end
-
-@kernel function _legendre_step_kern!(out, @Const(x), @Const(pb), @Const(pa), a, b)
-    i = @index(Global)
-    @inbounds out[i] = a * x[i] * pb[i] - b * pa[i]
-end
-
-@kernel function _scale_inplace_kern!(P, @Const(s), fac)
-    i = @index(Global)
-    @inbounds P[i] *= fac * s[i]
-end
-
-function PartialFSHT._scale_legendre_device!(out::GPUArraysCore.AbstractGPUArray, x, P, c)
-    backend = KernelAbstractions.get_backend(out)
-    _scale_legendre_kern!(backend)(out, x, P, c; ndrange = length(out))
-    _sync(backend)
-    return out
-end
-
-function PartialFSHT._legendre_step_device!(out::GPUArraysCore.AbstractGPUArray, x, pb, pa, a, b)
-    backend = KernelAbstractions.get_backend(out)
-    _legendre_step_kern!(backend)(out, x, pb, pa, a, b; ndrange = length(out))
-    _sync(backend)
-    return out
-end
-
-function PartialFSHT._scale_inplace_device!(P::GPUArraysCore.AbstractGPUArray, s, fac)
-    backend = KernelAbstractions.get_backend(P)
-    _scale_inplace_kern!(backend)(P, s, fac; ndrange = length(P))
-    _sync(backend)
-    return P
-end
-
 end

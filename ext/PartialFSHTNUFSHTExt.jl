@@ -16,9 +16,10 @@ struct NUFSHTLeaf{P, A}
 end
 
 PartialFSHT.algorithm(::NUFSHTLeaf) = PartialFSHT.NUFSHTAlgorithm()
+PartialFSHT.ring_work(::NUFSHTLeaf) = 0
 
 function PartialFSHT._build_leaf(::PartialFSHT.NUFSHTAlgorithm, θ, φ, lmax, ntrans, spin,
-                                 tol, nufft_b, target_θstar, k)
+                                 tol, nufft_b, maxboxes)
     if Int(spin) == 0
         nplan = NUFSHT.make_plan(ComplexF64, θ, φ, lmax; tol = tol, ntrans = ntrans)
         nθ, nφ = PartialFSHT.coeff_size(lmax)

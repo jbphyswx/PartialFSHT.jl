@@ -25,7 +25,7 @@ function PartialFSHT._mul_adj_threaded!(alm, plan::PartialFSHT.Plan, f,
     return _threaded_adjoint!(alm, f, plan.leaf, plan)
 end
 
-function _threaded_synthesize!(f, alm, leaf::PartialFSHT.ClusterLeaf, plan)
+function _threaded_synthesize!(f, alm, leaf::PartialFSHT.MultiBoxLeaf, plan)
     B = plan.ntrans
     PartialFSHT._assert_field(f, length(leaf.θ), B)
     fill!(f, zero(eltype(f)))
@@ -50,29 +50,40 @@ end
 
 _threaded_synthesize!(f, alm, leaf, plan) = PartialFSHT._synthesize!(f, alm, leaf, plan)
 
-function _threaded_adjoint!(alm, f, leaf::PartialFSHT.ClusterLeaf, plan)
+function _threaded_adjoint!(alm, f, leaf::PartialFSHT.MultiBoxLeaf, plan)
     B = plan.ntrans
     fill!(alm, zero(eltype(alm)))
-    accs = leaf.almbufs
-    OhMyThreads.@tasks for i in eachindex(leaf.leaves)
-        g = leaf.groups[i]
-        sub = leaf.leaves[i]
-        fg = leaf.fgs[i]
-        acc = accs[i]
-        @inbounds if ndims(f) == 1
-            for (j, k) in enumerate(g)
-                fg[j, 1] = f[k]
-            end
-        else
-            for b in 1:B, (j, k) in enumerate(g)
-                fg[j, b] = f[k, b]
-            end
-        end
-        fill!(acc, zero(eltype(acc)))
-        PartialFSHT.adjoint_stretch!(acc, fg, sub)
+    accs = leaf.accs
+    sums = leaf.sums
+    nacc = length(accs)
+    for s in sums
+        fill!(s, zero(eltype(s)))
     end
-    for acc in accs
-        alm .+= acc
+    # One accumulator slot per task, and each slot is owned by exactly one task: boxes are
+    # chunked rather than round-robined, so no two tasks ever touch the same buffer.
+    nbox = length(leaf.leaves)
+    OhMyThreads.@tasks for t in 1:nacc
+        acc = accs[t]
+        sum_t = sums[t]
+        for i in t:nacc:nbox
+            g = leaf.groups[i]
+            sub = leaf.leaves[i]
+            fg = leaf.fgs[i]
+            @inbounds if ndims(f) == 1
+                for (j, k) in enumerate(g)
+                    fg[j, 1] = f[k]
+                end
+            else
+                for b in 1:B, (j, k) in enumerate(g)
+                    fg[j, b] = f[k, b]
+                end
+            end
+            PartialFSHT.adjoint_stretch!(acc, fg, sub)
+            sum_t .+= acc
+        end
+    end
+    for s in sums
+        PartialFSHT._accumulate_coeffs!(alm, s, B)
     end
     return alm
 end
