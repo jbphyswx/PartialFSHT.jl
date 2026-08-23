@@ -11,7 +11,7 @@ makedocs(;
     pages = [
         "Home" => "index.md",
         "Theory" => "theory.md",
-        "Rank experiments" => "ranks.md",
+        "Recoverability" => "recoverability.md",
         "API" => "api.md",
     ],
     warnonly = [:missing_docs, :docs_block],

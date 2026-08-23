@@ -26,9 +26,36 @@ function _nufft_setpts! end
 function _nufft_exec! end
 function _nufft_destroy! end
 
+"""
+    DirectSumBackend()
+
+Evaluate the Fourier series by direct summation: `O(M · n₁n₂)`, exact, and the reference the
+fast backends are tested against. Never selected by [`AutoNUFFT`](@ref).
+"""
 struct DirectSumBackend end
+
+"""
+    FINUFFTBackend()
+
+FINUFFT guru plans. Needs `using FINUFFT`; `CuArray` nodes route to cuFINUFFT.
+"""
 struct FINUFFTBackend end
+
+"""
+    NonuniformFFTsBackend()
+
+NonuniformFFTs.jl — pure Julia, and device-generic through KernelAbstractions. Needs
+`using NonuniformFFTs`.
+"""
 struct NonuniformFFTsBackend end
+
+"""
+    AutoNUFFT()
+
+Pick whichever fast backend is loaded, and error if none is. It will not silently fall back to
+[`DirectSumBackend`](@ref): that is a `10⁶`-fold slowdown a caller would not notice until it had
+already cost them the run.
+"""
 struct AutoNUFFT end
 
 function _nufft_makeplan(::DirectSumBackend, x::AbstractVector, y::AbstractVector,
@@ -110,7 +137,10 @@ end
 function _resolve_nufft(::AutoNUFFT)
     _ext_loaded(:PartialFSHTFINUFFTExt) && return FINUFFTBackend()
     _ext_loaded(:PartialFSHTNonuniformFFTsExt) && return NonuniformFFTsBackend()
-    return DirectSumBackend()
+    throw(ArgumentError(
+        "no fast NUFFT is loaded. Add `using NonuniformFFTs` (pure Julia, also GPU) or " *
+        "`using FINUFFT`, or pass `nufft = DirectSumBackend()` to ask for the O(M·n₁n₂) " *
+        "reference explicitly."))
 end
 
 @inline _ext_loaded(name::Symbol) = Base.get_extension(@__MODULE__, name) !== nothing

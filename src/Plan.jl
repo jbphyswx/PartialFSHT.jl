@@ -83,9 +83,12 @@ function Plan(θ::AbstractVector, φ::AbstractVector;
     spin == 0 || abs(spin) <= lmax ||
         throw(ArgumentError("(|spin| = $(abs(spin))) > lmax = $lmax"))
     be = _resolve_backend(backend)
-    nufft_b = _resolve_nufft(nufft)
     T = float(eltype(θ))
     chosen = select_method(θ, φ, lmax, tol, method, ntrans, Int(spin))
+    # Resolve the NUFFT only for leaves that use one: `AutoNUFFT` errors when no fast backend is
+    # loaded, and a direct evaluation has no business demanding one.
+    nufft_b = (chosen isa StretchAlgorithm || chosen isa MultiBoxAlgorithm) ?
+        _resolve_nufft(nufft) : nufft
     leaf = _build_leaf(chosen, θ, φ, Int(lmax), Int(ntrans), Int(spin), T(tol), nufft_b,
                        Int(maxboxes))
     return Plan{T, typeof(leaf), typeof(be), typeof(θ), typeof(nufft_b)}(

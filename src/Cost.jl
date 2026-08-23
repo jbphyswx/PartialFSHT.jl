@@ -36,8 +36,9 @@ struct NUFSHTAlgorithm <: AbstractAlgorithm end
     CostConstants
 
 Per-unit costs in arbitrary consistent units, measured by `benchmark/calibrate.jl` and
-overwritten via [`set_cost_constants!`](@ref). Defaults are deliberately crude — a planner
-running on defaults should be treated as uncalibrated, not as tuned.
+overwritten via [`set_cost_constants!`](@ref). Defaults are the measured *ratios* from
+`benchmark/calibrate.jl`; [`cost_calibrated`](@ref) reports whether they were measured on this
+machine.
 
 - `ring` — one retained `(ℓ, m, ring)` triple of the ALF pass
 - `fft` — one `n log n` butterfly unit
@@ -52,7 +53,11 @@ mutable struct CostConstants
     calibrated::Bool
 end
 
-const _COST = CostConstants(1.0, 1.0, 1.0, 4.0, false)
+# Defaults are the *ratios* measured by `benchmark/calibrate.jl` on a 20° cap at tol = 1e-8,
+# normalised to the ring unit (1.86 ns/triple there). Only ratios matter, since `select_method`
+# compares costs rather than predicting wall-clock, so these are portable in a way absolute
+# timings would not be. `cost_calibrated()` still reports `false` until measured on this machine.
+const _COST = CostConstants(1.0, 0.394, 0.334, 5.18, false)
 
 """
     set_cost_constants!(; ring, fft, spread, ft_conn) -> CostConstants
@@ -116,12 +121,20 @@ function cost_stretch(box::SphereBox, npts::Integer, lmax::Integer, ntrans::Inte
         err isa ArgumentError && return Inf
         rethrow()
     end
-    nθ_half = geom.kind === :interior ? next_smooth(2 * geom.K + 1) : geom.K + 1
-    nθ = geom.kind === :interior ? nθ_half : next_smooth(2 * nθ_half)
-    θr, _ = stretch_rings(geom, geom.kind === :interior ? nθ : nθ ÷ 2)
+    # Mirror StretchLeaf's own sizing exactly; costing a grid the leaf would not build makes
+    # the model wrong in the one place it is consulted.
+    Kθ = geom.K + _K_MARGIN
+    if geom.kind === :interior
+        nθ = next_smooth(2 * Kθ + 1)
+        nθ_half = nθ
+    else
+        nθ_half = next_smooth(Kθ + 1)
+        nθ = 2 * nθ_half
+    end
+    θr, _ = stretch_rings(geom, nθ_half)
     rings = counted_ring_work(sort(θr), L, tol)
     mmax = maximum(polar_mmax(t, L, tol) for t in θr)
-    nφ = next_smooth(2 * mmax + 1)
+    nφ = next_smooth_even(2 * mmax + 1)
     fft = _fftunits(nφ) * length(θr) + _fftunits(nθ * nφ)
     spread = Float64(npts) * (2 * ceil(abs(log10(max(float(tol), 1e-16)))) + 2)^2
     return B * (_COST.ring * rings + _COST.fft * fft + _COST.spread * spread)

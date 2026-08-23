@@ -9,10 +9,28 @@ Spin-weighted coefficients use a dense `(ℓ+1, m+lmax+1)` layout, matching NUFS
 public `spin_coeff_index`.
 """
 
+"""
+    coeff_size(lmax) -> Tuple{Int,Int}
+
+Shape of a coefficient array, `(lmax+1, 2lmax+1)`. Only `(lmax+1)²` of those slots are real
+modes; the rest are padding the transform never reads, so filling a whole array with random
+numbers is fine for comparing fields and wrong for comparing coefficients.
+"""
 @inline coeff_size(lmax::Integer) = (Int(lmax) + 1, 2Int(lmax) + 1)
 
+"""
+    sph_mode(ℓ, m) -> CartesianIndex
+
+Index of the degree-`ℓ`, order-`m` coefficient, in FastSphericalHarmonics packing.
+"""
 @inline sph_mode(ℓ::Integer, m::Integer) = FastSphericalHarmonics.sph_mode(ℓ, m)
 
+"""
+    spin_coeff_index(ℓ, m, lmax) -> CartesianIndex
+
+Index of a spin-weighted coefficient in the dense `(ℓ+1, m+lmax+1)` layout, matching NUFSHT's
+public spin packing.
+"""
 @inline spin_coeff_index(ℓ::Integer, m::Integer, lmax::Integer) =
     CartesianIndex(Int(ℓ) + 1, Int(m) + Int(lmax) + 1)
 
