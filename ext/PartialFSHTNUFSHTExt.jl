@@ -19,16 +19,19 @@ PartialFSHT.algorithm(::NUFSHTLeaf) = PartialFSHT.NUFSHTAlgorithm()
 PartialFSHT.ring_work(::NUFSHTLeaf) = 0
 
 function PartialFSHT._build_leaf(::PartialFSHT.NUFSHTAlgorithm, θ, φ, lmax, ntrans, spin,
-                                 tol, nufft_b, maxboxes)
+                                 tol, nufft_b, opts)
+    # Element type follows the node set, as it does on every other leaf. Pinning ComplexF64 here
+    # would make a Float32 plan silently widen on this leaf alone.
+    CT = Complex{float(eltype(θ))}
     if Int(spin) == 0
-        nplan = NUFSHT.make_plan(ComplexF64, θ, φ, lmax; tol = tol, ntrans = ntrans)
+        nplan = NUFSHT.make_plan(CT, θ, φ, lmax; tol = tol, ntrans = ntrans)
         nθ, nφ = PartialFSHT.coeff_size(lmax)
         cbuf = ntrans == 1 ?
-            PartialFSHT._zeros_like(θ, ComplexF64, nθ, nφ) :
-            PartialFSHT._zeros_like(θ, ComplexF64, nθ, nφ, ntrans)
+            PartialFSHT._zeros_like(θ, CT, nθ, nφ) :
+            PartialFSHT._zeros_like(θ, CT, nθ, nφ, ntrans)
         return NUFSHTLeaf(nplan, cbuf)
     end
-    nplan = NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, Int(spin); tol = tol, ntrans = ntrans)
+    nplan = NUFSHT.make_spin_plan(CT, θ, φ, lmax, Int(spin); tol = tol, ntrans = ntrans)
     return NUFSHTLeaf(nplan, nothing)
 end
 

@@ -1,19 +1,15 @@
-"""
-Conversion between complex orthonormal Condon–Shortley coefficients `a_{ℓm}`
-(this package) and FastTransforms / FastSphericalHarmonics *real* packing `c_{ℓm}`
-(NUFSHT's real-field specialization).
-
-Derived so that `Σ_m a_m Y_ℓm = Σ_m c_m Y_ℓm^{FT}` with the pairing
-
-    c_0 = a_0
-    c_m  = (-1)^m / √2 (a_m + (-1)^m a_{-m})     (m > 0)
-    c_{-m} = (-1)^m / √2 ⋅ i (a_m - (-1)^m a_{-m})
-
-and inverse
-
-    a_m    = √2/2 ⋅ (-1)^m (c_m - i c_{-m})
-    a_{-m} = √2/2 ⋅ (c_m + i c_{-m})
-"""
+# Conversion between this package's complex orthonormal Condon–Shortley coefficients a_{ℓm} and
+# FastTransforms / FastSphericalHarmonics *real* packing c_{ℓm} (NUFSHT's real-field
+# specialisation). Derived so that Σ_m a_m Y_ℓm = Σ_m c_m Y_ℓm^FT, with the pairing
+#
+#     c_0    = a_0
+#     c_m    = (-1)^m / √2 (a_m + (-1)^m a_{-m})              (m > 0)
+#     c_{-m} = (-1)^m / √2 ⋅ i (a_m - (-1)^m a_{-m})
+#
+# and inverse
+#
+#     a_m    = √2/2 ⋅ (-1)^m (c_m - i c_{-m})
+#     a_{-m} = √2/2 ⋅ (c_m + i c_{-m})
 
 function complex_to_fasttransforms!(c, a, lmax::Integer)
     B = _ntrans(a)

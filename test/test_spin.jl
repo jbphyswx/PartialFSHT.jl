@@ -41,6 +41,96 @@ Test.@testset "Wigner-d" begin
     end
 end
 
+Test.@testset "spin ring engine against wigner_d" begin
+    # The spin *fast* path is otherwise gated only against the spin *oracle*, and both share
+    # `SpinRings` — so a fault in the shared ring engine would cancel out of that comparison.
+    # `wigner_d` is the independent reference: a single-value, block-scaled evaluation.
+    #
+    # Errors are measured against the ring *maximum*, not against each ring's own value. Polar
+    # optimisation deliberately drops orders that are evanescent on a ring, and there they are
+    # small in absolute terms while a self-relative error is meaningless — the dropped entries here
+    # sit at 1e-180 and below relative to the peak.
+    Test.@testset "wide colatitude span, large orders" begin
+        nθ = 200
+        θ = collect(range(0.01, 0.6; length = nθ))
+        for L in (128, 256, 512)
+            eng = PartialFSHT.SpinRings(θ, L, 2, 0.0)
+            for m in (L ÷ 4, L ÷ 2, 3L ÷ 4, L - 1)
+                alm = zeros(ComplexF64, L + 1, 2L + 1)
+                alm[PartialFSHT.spin_coeff_index(L, m, L)] = 1
+                G = zeros(ComplexF64, nθ, 2L + 1, 1)
+                PartialFSHT.spin_rings_from_alm!(G, alm, eng)
+                refs = [PartialFSHT._Nℓ(Float64, L) *
+                        PartialFSHT.wigner_d(Float64, L, m, -2, θ[j]) for j in 1:nθ]
+                peak = maximum(abs, refs)
+                Test.@test peak > 0
+                worst = 0.0
+                worst_dropped = 0.0
+                for j in 1:nθ
+                    got = real(G[j, m + L + 1, 1])
+                    if got == 0 && refs[j] != 0
+                        worst_dropped = max(worst_dropped, abs(refs[j]) / peak)
+                    else
+                        worst = max(worst, abs(got - refs[j]) / peak)
+                    end
+                end
+                Test.@test worst < 1e-12
+                # Anything truncated must have been negligible, so truncation cannot hide an error.
+                Test.@test worst_dropped < 1e-30
+            end
+        end
+    end
+
+    Test.@testset "chunking bounds the shared exponent's span" begin
+        # Both engines carry one power-of-two exponent per ring chunk, and both must split a chunk
+        # before its spread can flush the smallest ring. The scalar engine bounds
+        # `mmax · |Δlog₂ sinθ|`; the spin seed's span is `2ℓ₀ · |Δlog₂ cos(θ/2) or sin(θ/2)|`, so a
+        # wide colatitude range at high degree must produce more than one chunk here too.
+        θwide = collect(range(0.01, 1.4; length = 300))
+        for L in (256, 1024)
+            Test.@test length(PartialFSHT.RingLegendre(θwide, L, 0.0).chunks) > 1
+            Test.@test length(PartialFSHT.SpinRings(θwide, L, 2, 0.0).chunks) > 1
+        end
+    end
+
+    Test.@testset "poles are exact without an endpoint special case" begin
+        # The tabulated seed reaches θ = 0 and θ = π through `p == 0` guards rather than branches,
+        # so those rings must come out exactly right.
+        L, s = 6, 2
+        θ = [0.0, 0.3, Float64(π) / 2, Float64(π) - 0.3, Float64(π)]
+        eng = PartialFSHT.SpinRings(θ, L, s, 0.0)
+        for m in (-3, 0, 2, 5)
+            alm = zeros(ComplexF64, L + 1, 2L + 1)
+            alm[PartialFSHT.spin_coeff_index(5, m, L)] = 1
+            G = zeros(ComplexF64, length(θ), 2L + 1, 1)
+            PartialFSHT.spin_rings_from_alm!(G, alm, eng)
+            for j in eachindex(θ)
+                ref = PartialFSHT._Nℓ(Float64, 5) * PartialFSHT.wigner_d(Float64, 5, m, -s, θ[j])
+                Test.@test real(G[j, m + L + 1, 1]) ≈ ref atol = 1e-13
+            end
+        end
+    end
+
+    Test.@testset "reflection is absorbed by the engine, not by the coefficients" begin
+        # `reflect = true` means the physical colatitudes are π .- θ. It must reproduce
+        # ₛY_{ℓm}(π-θ) = (-1)^{ℓ+m} ₋ₛY_{ℓm}(θ) with the spin weight left alone.
+        L, s = 8, 1
+        θasc = collect(range(0.2, 1.1; length = 9))
+        eng = PartialFSHT.SpinRings(θasc, L, s, 0.0; reflect = true)
+        for (ℓ, m) in ((3, 2), (7, -5), (8, 0))
+            alm = zeros(ComplexF64, L + 1, 2L + 1)
+            alm[PartialFSHT.spin_coeff_index(ℓ, m, L)] = 1
+            G = zeros(ComplexF64, length(θasc), 2L + 1, 1)
+            PartialFSHT.spin_rings_from_alm!(G, alm, eng)
+            for j in eachindex(θasc)
+                ref = PartialFSHT._Nℓ(Float64, ℓ) *
+                      PartialFSHT.wigner_d(Float64, ℓ, m, -s, Float64(π) - θasc[j])
+                Test.@test real(G[j, m + L + 1, 1]) ≈ ref atol = 1e-12
+            end
+        end
+    end
+end
+
 Test.@testset "spin-weighted harmonics" begin
     Test.@testset "spin 0 reduces to the scalar harmonic" begin
         θ, φ = 0.8, 2.1

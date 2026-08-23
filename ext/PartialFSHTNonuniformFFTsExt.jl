@@ -24,7 +24,8 @@ struct NonuniformFFTsPlan{P, V}
 end
 
 function PartialFSHT._nufft_makeplan(::PartialFSHT.NonuniformFFTsBackend, x::AbstractVector, y::AbstractVector,
-                                     type, n_modes, iflag, ntrans, tol; dtype = Float64, modeord = 1, kwargs...)
+                                     type, n_modes, iflag, ntrans, tol;
+                                     dtype = float(eltype(x)), modeord = 1, kwargs...)
     Ns = (Int(n_modes[1]), Int(n_modes[2]))
     plan = NonuniformFFTs.PlanNUFFT(Complex{dtype}, Ns;
                                     ntransforms = Int(ntrans),

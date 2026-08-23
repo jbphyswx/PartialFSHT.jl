@@ -48,6 +48,62 @@ Test.@testset "mode coupling" begin
         Test.@test M ≈ LinearAlgebra.I(L + 1) atol = 1e-10
     end
 
+    Test.@testset "a dense mask spectrum, against the untabulated closed form" begin
+        # The tabulated `loggamma` must cover the largest triple the sum reaches: ℓ, ℓ' ≤ L and
+        # ℓ'' ≤ min(ℓ+ℓ', nW), so J can reach 2L + min(2L, nW). A mask spectrum with only its first
+        # few entries nonzero never exercises that, because the zeros are skipped — so this uses a
+        # dense W_ℓ over the whole 2L+1 range, which is what a real apodised mask looks like.
+        for L in (8, 16, 24)
+            W = [1.0 / (1 + ℓ)^2 for ℓ in 0:(2L)]
+            M = PartialFSHT.mask_coupling(W, L)
+            Test.@test all(isfinite, M)
+            Test.@test all(M .>= -1e-14)
+            # element-by-element against the reference that calls `loggamma` directly
+            ref = zeros(L + 1, L + 1)
+            for ℓ in 0:L, ℓp in 0:L
+                acc = 0.0
+                for ℓpp in abs(ℓ - ℓp):min(ℓ + ℓp, 2L)
+                    lg = PartialFSHT.threej000_sq_log(ℓ, ℓp, ℓpp)
+                    isfinite(lg) || continue
+                    acc += (2ℓpp + 1) * W[ℓpp + 1] * exp(lg)
+                end
+                ref[ℓ + 1, ℓp + 1] = (2ℓp + 1) * acc / (4π)
+            end
+            Test.@test M ≈ ref rtol = 1e-10
+        end
+    end
+
+    Test.@testset "a flat mask spectrum exercises the 3-j sum rule" begin
+        # With W_ℓ ≡ w the inner sum is Σ_{ℓ''} (2ℓ''+1) (ℓ ℓ' ℓ''; 000)² = 1 exactly, so
+        # M_{ℓℓ'} = (2ℓ'+1) w / 4π — every row proportional to the same vector, hence rank one and
+        # singular *by construction*, not by numerical accident. That makes the flat case a sharp
+        # test of the whole kernel: it must reproduce the sum rule to round-off, and it reaches the
+        # largest ℓ'' the sum admits, which is where an undersized `loggamma` table shows up.
+        for L in (8, 24)
+            w = 0.25 / (4π)
+            W = fill(w, 2L + 1)
+            M = PartialFSHT.mask_coupling(W, L)
+            Test.@test all(isfinite, M)
+            for ℓ in 0:L, ℓp in 0:L
+                # the sum rule truncates at ℓ'' ≤ ℓ+ℓ', which W_ℓ covers here
+                Test.@test M[ℓ + 1, ℓp + 1] ≈ (2ℓp + 1) * w / (4π) rtol = 1e-10
+            end
+            Test.@test LinearAlgebra.rank(M; rtol = 1e-8) == 1
+        end
+    end
+
+    Test.@testset "a decaying mask spectrum gives an invertible per-degree system" begin
+        # `spectrum` at Δℓ = 1 inverts the unbinned coupling directly. A real mask's power is
+        # concentrated at low ℓ, and then the coupling is a banded smoother rather than rank one.
+        L = 24
+        W = [exp(-ℓ / 3.0) / (4π) for ℓ in 0:(2L)]
+        M = PartialFSHT.mask_coupling(W, L)
+        Test.@test all(isfinite, M)
+        Mb = PartialFSHT.bin_coupling(M, PartialFSHT.band_edges(L, 1))
+        Test.@test all(isfinite, Mb)
+        Test.@test abs(LinearAlgebra.det(Mb)) > 0
+    end
+
     Test.@testset "coupling conserves power and binning is invertible" begin
         L = 16
         W = zeros(2L + 1)

@@ -1,24 +1,17 @@
-"""
-Stretched-interval leaf: the workhorse partial-sky transform.
-
-Evaluate the degree-`lmax` field on the few rings that intersect the data's colatitude
-interval, apodise, periodise, and interpolate to the sample points with one small NUFFT. This
-is Carron & Reinecke's construction (arXiv:2603.17166) with the coefficient rotation removed —
-they never rotate, they *assume* a frame with the patch at a pole, and a per-apply Wigner
-rotation costs eight times the ring work it saves.
-
-    alm ──ring ALF (polar-optimised)──▶ G[ring, m]
-        ──apodise in θ──▶ periodise (DFS at a pole, two-sided otherwise)
-        ──2-D FFT──▶ reduced Fourier torus ──type-2 NUFFT──▶ f(Ωᵢ)
-
-The adjoint is the same pipeline transposed, step by step, so `⟨𝒴a, f⟩ = ⟨a, 𝒴*f⟩` holds to
-round-off rather than to the tolerance of a quadrature.
-
-Longitude is reduced by polar optimisation (`nφ = 2 m_max + 1`), which is the whole reduction
-when the interval touches a pole and a partial one otherwise. Stretching the longitude *arc*
-as well is a further saving for mid-latitude patches; it needs a zoom/chirp-z per ring and is
-gated on the calibration measurement rather than assumed.
-"""
+# Stretched-interval leaf: the workhorse partial-sky transform.
+#
+#     alm ──ring ALF (polar-optimised)──▶ G[ring, m]
+#         ──apodise in θ──▶ periodise (DFS at a pole, two-sided otherwise)
+#         ──2-D FFT──▶ reduced Fourier torus ──type-2 NUFFT──▶ f(Ωᵢ)
+#
+# Carron & Reinecke's construction (arXiv:2603.17166) with no coefficient rotation — they never
+# rotate either, they assume a frame with the patch at a pole. The adjoint is this pipeline
+# transposed step by step, so ⟨𝒴a, f⟩ = ⟨a, 𝒴*f⟩ holds to round-off rather than to a quadrature's
+# tolerance.
+#
+# Longitude is reduced by polar optimisation (nφ = 2 m_max + 1), which is the whole reduction when
+# the interval touches a pole and a partial one otherwise. Stretching the longitude *arc* as well
+# would help mid-latitude patches; it needs a zoom/chirp-z per ring and is gated on measurement.
 
 # FFTW's thread count is process-global and is baked into a plan at planning time.
 const _FFTW_PLAN_LOCK = ReentrantLock()
@@ -62,9 +55,8 @@ next_smooth_even(n::Integer) = 2 * next_smooth(cld(Int(n), 2))
     next_smooth(n) -> Int
 
 Smallest `5`-smooth integer `≥ n`. Grid sizes are free to grow — oversampling only improves the
-trigonometric interpolation — and every size the previous planner chose had a large prime
-factor (`nφ = 17·19, 3·181, 5·191, 5·349, 3·1091` at `lmax = 256…4096`), which puts FFTW on a
-Rader/Bluestein path for nothing.
+trigonometric interpolation — while a large prime factor puts FFTW on a Rader/Bluestein path for
+nothing, so every planner-chosen size is rounded up rather than used as derived.
 """
 function next_smooth(n::Integer)
     n <= 1 && return 1
@@ -99,7 +91,7 @@ const _K_MARGIN = 2
 One box, one stretched-interval transform. Buffers and plans are built once; an apply
 allocates nothing.
 """
-struct StretchLeaf{T, CT, VT, VC, PT, A3, A2, EN, RB, RF, FP, IP, N2, N1, NB}
+struct StretchLeaf{T, CT, VT, VC, A3, A2, EN, RB, RF, FP, IP, N2, N1, NB}
     box::SphereBox{T}
     geomθ::StretchGeometry{T}
     lmax::Int
@@ -117,8 +109,6 @@ struct StretchLeaf{T, CT, VT, VC, PT, A3, A2, EN, RB, RF, FP, IP, N2, N1, NB}
     wθ::VT
     Θ_pts::VT
     φ_pts::VT
-    parity::PT              # (-1)^{ℓ+m} coefficient-shaped signs, empty unless flip_south
-    almwork::A3
     G::A3
     Fφ::A3
     F::A3
@@ -140,7 +130,7 @@ function StretchLeaf(θ::AbstractVector, φ::AbstractVector, lmax::Integer, ntra
                      tol::Real; nufft_backend = DirectSumBackend(), spin::Integer = 0,
                      box = nothing, εapo_max::Real = _EPS_APO_MAX,
                      oversample_θ::Real = 1, oversample_φ::Real = 1,
-                     fft_threads::Integer = 1)
+                     fft_threads::Integer = 1, nufft_kwargs::NamedTuple = (;))
     T = float(eltype(θ))
     CT = Complex{T}
     L = Int(lmax)
@@ -151,8 +141,9 @@ function StretchLeaf(θ::AbstractVector, φ::AbstractVector, lmax::Integer, ntra
     # ascending θ, and the grid's θ-FFT needs rows in ascending Θ; those two orders are then
     # reversed relative to each other, which silently transposes the grid and makes the result
     # O(1) wrong. So whenever the cheapest periodisation is the southern one, reflect the whole
-    # problem to the north instead: Y_ℓm(π-θ,φ) = (-1)^{ℓ+m} Y_ℓm(θ,φ), so one sign pass on the
-    # coefficients replaces all of the descending-order bookkeeping.
+    # problem to the north and let the engine absorb the reflection: `sin(π-θ) = sin θ`, so the
+    # identity Y_ℓm(π-θ,φ) = (-1)^{ℓ+m} Y_ℓm(θ,φ) is realised by one sign on `cosθ` at build time
+    # (`reflect = true`) rather than by a pass over the coefficients on every apply.
     #
     # The decision has to come from the *chosen* geometry rather than from whether the box
     # literally touches θ = π: a patch at θ ≈ π - 0.3 touches nothing yet is still cheapest as a
@@ -160,8 +151,10 @@ function StretchLeaf(θ::AbstractVector, φ::AbstractVector, lmax::Integer, ntra
     tiny = sqrt(eps(T))
     geom0 = stretch_geometry(bx.θlo, bx.θhi, L, tol; εapo_max = εapo_max)
     flip = geom0.kind === :pole && geom0.θhi >= T(π) - tiny && geom0.θlo > tiny
-    θw = flip ? [T(π) - T(t) for t in _host(θ)] : T.(_host(θ))
-    bxw = flip ? bounding_box(θw, _host(φ)) : bx
+    # Reflecting θ ↦ π-θ maps the box exactly, so there is no need to materialise a reflected copy
+    # of the point set just to re-derive it.
+    bxw = flip ? SphereBox{T}(T(π) - bx.θhi, T(π) - bx.θlo, bx.φstart, bx.φextent,
+                              bx.touches_south, bx.touches_north) : bx
     geomθ = flip ? stretch_geometry(bxw.θlo, bxw.θhi, L, tol; εapo_max = εapo_max) : geom0
 
     # A pole/full periodisation is DFS-doubled, so the full grid must be exactly twice the
@@ -185,32 +178,40 @@ function StretchLeaf(θ::AbstractVector, φ::AbstractVector, lmax::Integer, ntra
         "ring colatitudes are not ascending for a $(geomθ.kind) periodisation on " *
         "θ ∈ [$(geomθ.θlo), $(geomθ.θhi)] — the grid and the ring engine would disagree"))
 
-    # A south-touching interval is reflected to the north. For spin the reflection also flips
-    # the spin weight, since d^ℓ_{m,-s}(π-θ) = (-1)^{ℓ+m} d^ℓ_{m,s}(θ), i.e.
-    # ₛY_{ℓm}(π-θ,φ) = (-1)^{ℓ+m} ₋ₛY_{ℓm}(θ,φ) — the same coefficient sign pass, opposite spin.
-    spin_eff = flip ? -Int(spin) : Int(spin)
-    eng = spin_eff == 0 ? RingLegendre(θ_rings_h, L, tol; ntrans = B, CT = CT) :
-                          SpinRings(θ_rings_h, L, spin_eff, tol; ntrans = B, CT = CT)
-    mmax = maximum(eng.mlim)
+    # `θ_rings_h` is ascending in the reflected frame; `reflect` tells the engine the physical
+    # colatitudes are `π .- θ_rings_h`, which it absorbs into `cosθ` (and, for spin, into the swap
+    # of the two half-angle factors — so the spin weight stays as the caller gave it).
+    #
+    # The engine is seeded from a ring vector of the *node set's* array type, so its tables and
+    # scratch land on the same device as the buffers. Handing it the host vector leaves the ring
+    # geometry on the host while `G` is on the device, which is a launch failure on real hardware
+    # and silently works on a CPU-backed KernelAbstractions backend.
+    θ_rings = _to_like(θ, θ_rings_h)
+    eng = Int(spin) == 0 ?
+        RingLegendre(θ_rings, L, tol; ntrans = B, CT = CT, reflect = flip) :
+        SpinRings(θ_rings, L, Int(spin), tol; ntrans = B, CT = CT, reflect = flip)
+    mmax = maximum(_host(eng.mlim))
     nφ = next_smooth_even(Int(ceil((2 * max(mmax, abs(Int(spin))) + 1) * oversample_φ)))
 
     wθ_h = similar(Θ_rings_h)
     stretch_window!(wθ_h, geomθ, Θ_rings_h)
 
-    θ_rings = _to_like(θ, θ_rings_h)
     Θ_rings = _to_like(θ, Θ_rings_h)
     wθ = _to_like(θ, wθ_h)
 
     n = length(θ)
-    Θ_pts_h = T[theta_to_stretch(geomθ, t) for t in θw]
-    φ_pts_h = T[mod(T(p), 2 * T(π)) for p in _host(φ)]
+    θ_h = _host(θ)
+    φ_h = _host(φ)
+    Θ_pts_h = Vector{T}(undef, n)
+    φ_pts_h = Vector{T}(undef, n)
+    @inbounds for i in 1:n
+        t = T(θ_h[i])
+        Θ_pts_h[i] = theta_to_stretch(geomθ, flip ? T(π) - t : t)
+        φ_pts_h[i] = mod(T(φ_h[i]), 2 * T(π))
+    end
     Θ_pts = _to_like(θ, Θ_pts_h)
     φ_pts = _to_like(θ, φ_pts_h)
 
-    parity = _to_like(θ, flip ? _parity_signs(T, L) : zeros(T, 0, 0))
-
-    nθc, nφc = coeff_size(L)
-    almwork = _zeros_like(θ, CT, nθc, nφc, B)
     G = _zeros_like(θ, CT, nθ_half, 2L + 1, B)
     Fφ = _zeros_like(θ, CT, nθ_half, nφ, B)
     F = _zeros_like(θ, CT, nθ_half, nφ, B)
@@ -232,28 +233,18 @@ function StretchLeaf(θ::AbstractVector, φ::AbstractVector, lmax::Integer, ntra
     phase_conj = _to_like(θ, conj.(phase_h))
 
     nufft2 = _nufft_makeplan(nufft_backend, Θ_pts, φ_pts, 2, (nθ, nφ), +1, B, float(tol);
-                             dtype = T, modeord = 1)
+                             dtype = T, modeord = 1, nufft_kwargs...)
     nufft1 = _nufft_makeplan(nufft_backend, Θ_pts, φ_pts, 1, (nθ, nφ), -1, B, float(tol);
-                             dtype = T, modeord = 1)
+                             dtype = T, modeord = 1, nufft_kwargs...)
 
-    return StretchLeaf{T, CT, typeof(θ_rings), typeof(phase), typeof(parity), typeof(G),
+    return StretchLeaf{T, CT, typeof(θ_rings), typeof(phase), typeof(G),
                        typeof(fbuf), typeof(eng), typeof(ring_bfft), typeof(ring_fft),
                        typeof(fft_plan), typeof(ifft_plan), typeof(nufft2), typeof(nufft1),
                        typeof(nufft_backend)}(
         bx, geomθ, L, B, Int(spin), T(tol), flip, nθ_half, nθ, nφ, mmax, eng,
-        θ_rings, Θ_rings, wθ, Θ_pts, φ_pts, parity, almwork, G, Fφ, F, F̃, Fhat, fbuf,
+        θ_rings, Θ_rings, wθ, Θ_pts, φ_pts, G, Fφ, F, F̃, Fhat, fbuf,
         phase, phase_conj, ring_bfft, ring_fft, fft_plan, ifft_plan, nufft2, nufft1,
         nufft_backend)
-end
-
-"""`(-1)^{ℓ+m}` laid out in the coefficient array, for the north/south reflection."""
-function _parity_signs(::Type{T}, lmax::Integer) where {T}
-    nθc, nφc = coeff_size(lmax)
-    s = zeros(T, nθc, nφc)
-    @inbounds for ℓ in 0:Int(lmax), m in -ℓ:ℓ
-        s[sph_mode(ℓ, m)] = iseven(ℓ + m) ? one(T) : -one(T)
-    end
-    return s
 end
 
 algorithm(::StretchLeaf) = StretchAlgorithm()
@@ -274,13 +265,7 @@ function synthesize_stretch!(f, alm, leaf::StretchLeaf,
     _assert_coeffs(alm, leaf.lmax, B)
     _assert_field(f, length(leaf.Θ_pts), B)
 
-    src = alm
-    if leaf.flip_south
-        _apply_parity!(leaf.almwork, alm, leaf.parity, B)
-        src = leaf.almwork
-    end
-
-    _fill_rings!(leaf.G, src, leaf.eng, backend)
+    _fill_rings!(leaf.G, alm, leaf.eng, backend)
     _rings_to_grid!(leaf.F, leaf.G, leaf.lmax, leaf.ring_bfft, leaf.Fφ)
     leaf.F .*= leaf.wθ
     _periodize!(leaf.F̃, leaf.F, leaf.geomθ, leaf.spin)
@@ -305,11 +290,7 @@ function adjoint_stretch!(alm, f, leaf::StretchLeaf,
     leaf.F .*= leaf.wθ
     _grid_to_rings!(leaf.G, leaf.F, leaf.lmax, leaf.ring_fft, leaf.Fφ)
 
-    dst = leaf.flip_south ? leaf.almwork : alm
-    _drain_rings!(dst, leaf.G, leaf.eng, backend)
-    if leaf.flip_south
-        _apply_parity!(alm, dst, leaf.parity, B)
-    end
+    _drain_rings!(alm, leaf.G, leaf.eng, backend)
     return alm
 end
 
@@ -319,21 +300,6 @@ _fill_rings!(G, alm, eng::RingLegendre, be) = rings_from_alm!(G, alm, eng, be)
 _fill_rings!(G, alm, eng::SpinRings, be) = spin_rings_from_alm!(G, alm, eng, be)
 _drain_rings!(alm, G, eng::RingLegendre, be) = alm_from_rings!(alm, G, eng, be)
 _drain_rings!(alm, G, eng::SpinRings, be) = spin_alm_from_rings!(alm, G, eng, be)
-
-function _apply_parity!(out, src, parity, B::Int)
-    if ndims(out) == 3 && ndims(src) == 3
-        @inbounds for b in 1:B
-            @views out[:, :, b] .= src[:, :, b] .* parity
-        end
-    elseif ndims(out) == 3
-        @inbounds @views out[:, :, 1] .= src .* parity
-    elseif ndims(src) == 3
-        @inbounds @views out .= src[:, :, 1] .* parity
-    else
-        out .= src .* parity
-    end
-    return out
-end
 
 # ---------------------------------------------------------------------------------------
 # Longitude: m-coefficients on rings ↔ samples on the reduced φ grid
@@ -356,29 +322,44 @@ function _grid_to_rings!(G, F, lmax::Integer, plan, scratch)
     return _unpack_orders!(G, scratch, lmax)
 end
 
+"""
+The order pack `m ↦ mod(m, nφ) + 1` is a *permutation* onto two contiguous blocks — orders `0:mkeep`
+land in columns `1:mkeep+1` and orders `-mkeep:-1` in `nφ-mkeep+1:nφ` — and both source ranges are
+contiguous too. Copying block-wise instead of column-by-column turns `2 m_max + 1` strided
+operations into two, which matters far more on a device (that many kernel launches, 2049 at
+`lmax = 1024`) than it does on a host.
+"""
+@inline function _order_blocks(nφ::Int, lmax::Int)
+    mkeep = min(lmax, (nφ - 1) ÷ 2)
+    off = lmax + 1
+    # (destination columns, source columns) for the non-negative and negative orders
+    return (mkeep,
+            (1:(mkeep + 1), off:(off + mkeep)),
+            ((nφ - mkeep + 1):nφ, (off - mkeep):(off - 1)))
+end
+
 function _pack_orders!(F, G, lmax::Integer)
-    fill!(F, zero(eltype(F)))
     nφ = size(F, 2)
-    B = size(F, 3)
-    off = Int(lmax) + 1
-    mkeep = min(Int(lmax), (nφ - 1) ÷ 2)
-    @inbounds for b in 1:B, m in -mkeep:mkeep
-        idx = mod(m, nφ) + 1
-        @views F[:, idx, b] .+= G[:, m + off, b]
-    end
+    mkeep, (dpos, spos), (dneg, sneg) = _order_blocks(nφ, Int(lmax))
+    # Only the unused middle columns need clearing; the rest is fully overwritten below.
+    mid = (mkeep + 2):(nφ - mkeep)
+    isempty(mid) || (@views fill!(F[:, mid, :], zero(eltype(F))))
+    @views copyto!(F[:, dpos, :], G[:, spos, :])
+    isempty(dneg) || (@views copyto!(F[:, dneg, :], G[:, sneg, :]))
     return F
 end
 
 function _unpack_orders!(G, F, lmax::Integer)
-    fill!(G, zero(eltype(G)))
     nφ = size(F, 2)
-    B = size(F, 3)
-    off = Int(lmax) + 1
-    mkeep = min(Int(lmax), (nφ - 1) ÷ 2)
-    @inbounds for b in 1:B, m in -mkeep:mkeep
-        idx = mod(m, nφ) + 1
-        @views G[:, m + off, b] .= F[:, idx, b]
-    end
+    L = Int(lmax)
+    mkeep, (dpos, spos), (dneg, sneg) = _order_blocks(nφ, L)
+    # Orders the reduced grid cannot carry are structurally absent, so they must be zeroed.
+    lead = 1:(L - mkeep)
+    trail = (L + mkeep + 2):(2L + 1)
+    isempty(lead) || (@views fill!(G[:, lead, :], zero(eltype(G))))
+    isempty(trail) || (@views fill!(G[:, trail, :], zero(eltype(G))))
+    @views copyto!(G[:, spos, :], F[:, dpos, :])
+    isempty(sneg) || (@views copyto!(G[:, sneg, :], F[:, dneg, :]))
     return G
 end
 
@@ -419,9 +400,9 @@ function _copy_field_out!(f, fbuf, B::Int)
 end
 
 function _copy_field_in!(fbuf, f, B::Int)
+    # A 1-D field is only accepted when B == 1 (see `_assert_field`), so there is no tail to clear.
     if ndims(f) == 1
         @views copyto!(fbuf[:, 1], f)
-        B > 1 && (@views fbuf[:, 2:B] .= 0)
     else
         copyto!(fbuf, f)
     end

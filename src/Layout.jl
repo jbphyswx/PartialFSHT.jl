@@ -1,13 +1,7 @@
-"""
-Coefficient array layout matching FastSphericalHarmonics / FastTransforms packing.
-
-Complex orthonormal spherical harmonics (Condon–Shortley) are stored in an
-`(lmax+1) × (2lmax+1)` array. The coefficient of degree `ℓ` and order `m` sits at
-`sph_mode(ℓ, m)`. Unused slots are zero.
-
-Spin-weighted coefficients use a dense `(ℓ+1, m+lmax+1)` layout, matching NUFSHT's
-public `spin_coeff_index`.
-"""
+# Coefficient array layout, matching FastSphericalHarmonics / FastTransforms packing: complex
+# orthonormal Condon–Shortley harmonics in an (lmax+1) × (2lmax+1) array, degree ℓ and order m at
+# `sph_mode(ℓ, m)`, unused slots zero. Spin-weighted coefficients use the dense
+# (ℓ+1, m+lmax+1) layout of NUFSHT's public `spin_coeff_index`.
 
 """
     coeff_size(lmax) -> Tuple{Int,Int}

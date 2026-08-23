@@ -1,12 +1,13 @@
 """
     PartialFSHTOhMyThreadsExt
 
-Threaded apply over independent plans, or over clusters of one [`ClusterLeaf`](@ref).
-Selected by `ComputationalBackends.ThreadedBackend`. Loaded by `using OhMyThreads`.
+Threading for `ComputationalBackends.ThreadedBackend`: the ring pass over spherical harmonic
+order, the boxes of a `MultiBoxLeaf`, the rows of a mask coupling matrix, and a farmed `mul!` over
+independent plans. Loaded by `using OhMyThreads`.
 
-Direct, stretch, and cluster leaves do not call FastTransforms, so they do not need
-the OpenMP-in-task bracket NUFSHT uses. A NUFSHT leaf's apply goes through NUFSHT,
-which already brackets FastTransforms when farmed.
+Direct, stretch, and multi-box leaves do not call FastTransforms, so they do not need the
+OpenMP-in-task bracket NUFSHT uses. A NUFSHT leaf's apply goes through NUFSHT, which already
+brackets FastTransforms when farmed.
 """
 module PartialFSHTOhMyThreadsExt
 
@@ -130,6 +131,22 @@ function _threaded_adjoint!(alm, f, leaf::PartialFSHT.MultiBoxLeaf, plan)
 end
 
 _threaded_adjoint!(alm, f, leaf, plan) = PartialFSHT._adjoint_apply!(alm, f, leaf, plan)
+
+# Rows of the MASTER coupling matrix are independent and each costs O(L²), so interleaving rather
+# than blocking keeps tasks balanced as the inner ℓ'' range grows with ℓ.
+function PartialFSHT._mask_coupling_rows!(M::AbstractMatrix, Wℓ::AbstractVector, L::Int, rows,
+                                          ::ComputationalBackends.AbstractThreadedBackend)
+    ns = min(max(1, Threads.nthreads()), length(rows))
+    if ns <= 1
+        PartialFSHT._mask_coupling_rows!(M, Wℓ, L, rows)
+        return M
+    end
+    rv = collect(rows)
+    OhMyThreads.@tasks for t in 1:ns
+        PartialFSHT._mask_coupling_rows!(M, Wℓ, L, view(rv, t:ns:length(rv)))
+    end
+    return M
+end
 
 function LinearAlgebra.mul!(fs::AbstractVector, plans::AbstractVector{<:PartialFSHT.Plan},
                             alms::AbstractVector, ::ComputationalBackends.AbstractThreadedBackend)

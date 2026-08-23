@@ -247,6 +247,7 @@ function PartialFSHT._walk_rings!(dir, G::GPUArraysCore.AbstractGPUArray, alm,
     nm = min(eng.mmax, L) + 1
     be = KernelAbstractions.get_backend(G)
     stride = PartialFSHT._RESCALE_STRIDE
+    _require_device(be, eng.cosθ, "ring geometry")
     if dir isa PartialFSHT._Fwd
         _rings_fwd_kern!(be)(G, _batched(alm), eng.cosθ, eng.log2sinθ, eng.log2c,
                              eng.mlim, L, B, stride; ndrange = (nθ, nm))
@@ -254,6 +255,193 @@ function PartialFSHT._walk_rings!(dir, G::GPUArraysCore.AbstractGPUArray, alm,
         almre = reinterpret(reshape, real(eltype(alm)), _batched(alm))
         _rings_adj_kern!(be)(almre, G, eng.cosθ, eng.log2sinθ, eng.log2c,
                             eng.mlim, L, B, stride; ndrange = (nθ, nm))
+    end
+    _sync(be)
+    return nothing
+end
+
+# A device apply whose engine tables live on the host is the one failure mode that reads as working
+# on a CPU-backed KA backend and dies on real hardware, so it is checked rather than left to the
+# kernel launch.
+@inline function _require_device(be, a, what)
+    KernelAbstractions.get_backend(a) === be || throw(ArgumentError(
+        "$what is on $(KernelAbstractions.get_backend(a)) but the transform is running on $be — " *
+        "build the plan from a node set of the intended array type"))
+    return nothing
+end
+
+# ---------------------------------------------------------------------------------------
+# Spin ring pass: one thread per (ring, order), the seed read from the engine's tables
+# ---------------------------------------------------------------------------------------
+
+@inline function _spin_seed(::Type{T}, lb2, pc::Int, ps::Int, l2c::T, l2s::T) where {T}
+    e = lb2
+    pc != 0 && (e += T(pc) * l2c)
+    ps != 0 && (e += T(ps) * l2s)
+    return e
+end
+
+@kernel function _spin_fwd_kern!(G, @Const(alm), @Const(cosθ), @Const(log2cos), @Const(log2sin),
+                                 @Const(Nℓ), @Const(lb2), @Const(pcs), @Const(pss), @Const(sgns),
+                                 @Const(mlim), L::Int, B::Int, spin::Int, stride::Int)
+    j, mi = @index(Global, NTuple)
+    m = mi - L - 1
+    @inbounds if mlim[j] >= abs(m)
+        T = eltype(cosθ)
+        CT = eltype(G)
+        off = L + 1
+        nn = -spin
+        l0 = max(abs(m), abs(nn))
+        if l0 <= L
+            x = cosθ[j]
+            e0 = _spin_seed(T, lb2[mi], pcs[mi], pss[mi], log2cos[j], log2sin[j])
+            if isfinite(e0)
+                Eseed = ceil(e0)
+                dseed = sgns[mi] * exp2(e0 - Eseed)
+                for b in 1:B
+                    E = Eseed
+                    d1 = dseed
+                    d0 = zero(T)
+                    # Grouped as `(coefficient × Nℓ) × d`, exactly as the host walk does, so the
+                    # forward direction is bit-identical rather than merely equal to round-off.
+                    # Complex multiplication is not associative in floating point.
+                    acc = (alm[l0 + 1, m + off, b] * Nℓ[l0 + 1]) * d1
+                    Lc = l0
+                    steps = 0
+                    while Lc < L
+                        L1 = Lc + 1
+                        sm1 = sqrt(max(zero(T), T(L1 * L1 - m * m)))
+                        sn1 = sqrt(max(zero(T), T(L1 * L1 - nn * nn)))
+                        den = T(Lc) * sm1 * sn1
+                        if den <= 0
+                            d0 = d1
+                            d1 = zero(T)
+                            Lc = L1
+                            continue
+                        end
+                        sm0 = sqrt(max(zero(T), T(Lc * Lc - m * m)))
+                        sn0 = sqrt(max(zero(T), T(Lc * Lc - nn * nn)))
+                        a1 = T(2 * Lc + 1) * T(Lc) * T(L1) / den
+                        a2 = T(2 * Lc + 1) * T(m) * T(nn) / den
+                        a0 = T(L1) * sm0 * sn0 / den
+                        dn = (a1 * x - a2) * d1 - a0 * d0
+                        d0 = d1
+                        d1 = dn
+                        Lc = L1
+                        acc += (alm[L1 + 1, m + off, b] * Nℓ[L1 + 1]) * d1
+                        steps += 1
+                        if steps == stride && Lc < L
+                            steps = 0
+                            mx = max(abs(d1), abs(d0))
+                            if mx > 0 && isfinite(mx)
+                                sh = ceil(log2(mx))
+                                if sh != 0
+                                    fsc = exp2(-sh)
+                                    d1 *= fsc
+                                    d0 *= fsc
+                                    acc *= fsc
+                                    E += sh
+                                end
+                            end
+                        end
+                    end
+                    G[j, m + off, b] = acc * exp2(E)
+                end
+            end
+        end
+    end
+end
+
+@kernel function _spin_adj_kern!(almre, @Const(G), @Const(cosθ), @Const(log2cos), @Const(log2sin),
+                                 @Const(Nℓ), @Const(lb2), @Const(pcs), @Const(pss), @Const(sgns),
+                                 @Const(mlim), L::Int, B::Int, spin::Int, stride::Int)
+    j, mi = @index(Global, NTuple)
+    m = mi - L - 1
+    @inbounds if mlim[j] >= abs(m)
+        T = eltype(almre)
+        off = L + 1
+        nn = -spin
+        l0 = max(abs(m), abs(nn))
+        if l0 <= L
+            x = cosθ[j]
+            e0 = _spin_seed(T, lb2[mi], pcs[mi], pss[mi], log2cos[j], log2sin[j])
+            if isfinite(e0)
+                Eseed = ceil(e0)
+                dseed = sgns[mi] * exp2(e0 - Eseed)
+                for b in 1:B
+                    g = G[j, m + off, b]
+                    E = Eseed
+                    d1 = dseed
+                    d0 = zero(T)
+                    _atomic_add_spin!(almre, l0, m, off, b, (d1 * exp2(E) * Nℓ[l0 + 1]) * g)
+                    Lc = l0
+                    steps = 0
+                    while Lc < L
+                        L1 = Lc + 1
+                        sm1 = sqrt(max(zero(T), T(L1 * L1 - m * m)))
+                        sn1 = sqrt(max(zero(T), T(L1 * L1 - nn * nn)))
+                        den = T(Lc) * sm1 * sn1
+                        if den <= 0
+                            d0 = d1
+                            d1 = zero(T)
+                            Lc = L1
+                            continue
+                        end
+                        sm0 = sqrt(max(zero(T), T(Lc * Lc - m * m)))
+                        sn0 = sqrt(max(zero(T), T(Lc * Lc - nn * nn)))
+                        a1 = T(2 * Lc + 1) * T(Lc) * T(L1) / den
+                        a2 = T(2 * Lc + 1) * T(m) * T(nn) / den
+                        a0 = T(L1) * sm0 * sn0 / den
+                        dn = (a1 * x - a2) * d1 - a0 * d0
+                        d0 = d1
+                        d1 = dn
+                        Lc = L1
+                        steps += 1
+                        if steps == stride && Lc < L
+                            steps = 0
+                            mx = max(abs(d1), abs(d0))
+                            if mx > 0 && isfinite(mx)
+                                sh = ceil(log2(mx))
+                                if sh != 0
+                                    fsc = exp2(-sh)
+                                    d1 *= fsc
+                                    d0 *= fsc
+                                    E += sh
+                                end
+                            end
+                        end
+                        _atomic_add_spin!(almre, Lc, m, off, b, (d1 * exp2(E) * Nℓ[Lc + 1]) * g)
+                    end
+                end
+            end
+        end
+    end
+end
+
+# Spin coefficients use the dense `(ℓ+1, m+lmax+1)` layout, so the index needs no `_cidx`.
+@inline function _atomic_add_spin!(almre, ℓ::Int, m::Int, off::Int, b::Int, v)
+    @inbounds KernelAbstractions.@atomic almre[1, ℓ + 1, m + off, b] += real(v)
+    @inbounds KernelAbstractions.@atomic almre[2, ℓ + 1, m + off, b] += imag(v)
+    return nothing
+end
+
+function PartialFSHT._spin_walk!(dir, G::GPUArraysCore.AbstractGPUArray, alm,
+                                 eng::PartialFSHT.SpinRings, backend)
+    L = eng.lmax
+    B = eng.ntrans
+    nθ = length(eng.θ)
+    be = KernelAbstractions.get_backend(G)
+    stride = PartialFSHT._RESCALE_STRIDE
+    _require_device(be, eng.cosθ, "spin ring geometry")
+    if dir isa PartialFSHT._Fwd
+        _spin_fwd_kern!(be)(G, _batched(alm), eng.cosθ, eng.log2cos_h, eng.log2sin_h,
+                            eng.Nℓ, eng.seed_lb2, eng.seed_pc, eng.seed_ps, eng.seed_sgn,
+                            eng.mlim, L, B, eng.spin, stride; ndrange = (nθ, 2L + 1))
+    else
+        almre = reinterpret(reshape, real(eltype(alm)), _batched(alm))
+        _spin_adj_kern!(be)(almre, G, eng.cosθ, eng.log2cos_h, eng.log2sin_h,
+                            eng.Nℓ, eng.seed_lb2, eng.seed_pc, eng.seed_ps, eng.seed_sgn,
+                            eng.mlim, L, B, eng.spin, stride; ndrange = (nθ, 2L + 1))
     end
     _sync(be)
     return nothing

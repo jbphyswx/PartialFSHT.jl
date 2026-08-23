@@ -1,11 +1,28 @@
 Test.@testset "cost model counts rather than guesses" begin
     Test.@testset "ring work grows with degree and shrinks with a thinner interval" begin
         θr = collect(range(1e-3, 0.4; length = 100))
-        w = [PartialFSHT.counted_ring_work(θr, L, 1e-8) for L in (128, 256, 512)]
+        w = [first(PartialFSHT.counted_ring_work(θr, L, 1e-8)) for L in (128, 256, 512)]
         Test.@test issorted(w)
-        wide = PartialFSHT.counted_ring_work(collect(range(1e-3, 1.5; length = 100)), 512, 1e-8)
-        narrow = PartialFSHT.counted_ring_work(collect(range(1e-3, 0.2; length = 100)), 512, 1e-8)
+        wide, mwide = PartialFSHT.counted_ring_work(collect(range(1e-3, 1.5; length = 100)),
+                                                    512, 1e-8)
+        narrow, mnarrow = PartialFSHT.counted_ring_work(collect(range(1e-3, 0.2; length = 100)),
+                                                        512, 1e-8)
         Test.@test narrow < wide
+        # The largest retained order comes back from the same pass, and a thinner interval keeps
+        # fewer orders, so the planner cannot size a grid from a count it did not make.
+        Test.@test mnarrow < mwide
+    end
+
+    Test.@testset "counting matches the engine it predicts" begin
+        # The cost model and the ring engine must agree exactly, or a planner decision is made
+        # about work that never happens.
+        for (L, hi) in ((128, 0.3), (512, 0.5), (512, 1.4))
+            θr = collect(range(1e-3, hi; length = 90))
+            counted, mmax = PartialFSHT.counted_ring_work(θr, L, 1e-8)
+            eng = PartialFSHT.RingLegendre(θr, L, 1e-8)
+            Test.@test counted == PartialFSHT.ring_work(eng)
+            Test.@test mmax == eng.mmax
+        end
     end
 
     Test.@testset "a degenerate geometry costs Inf rather than throwing" begin

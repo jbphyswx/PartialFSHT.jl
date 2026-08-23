@@ -18,11 +18,12 @@ Run with the test environment, which carries NUFSHT and a NUFFT backend:
 using PartialFSHT: PartialFSHT
 using NUFSHT: NUFSHT
 using NonuniformFFTs: NonuniformFFTs
+using FINUFFT: FINUFFT
 using OhMyThreads: OhMyThreads
 using ComputationalBackends: ComputationalBackends
 using LinearAlgebra: LinearAlgebra
 using Random: Random
-using Printf: @printf, @sprintf
+using Printf: Printf
 
 const PF = PartialFSHT
 
@@ -30,20 +31,26 @@ const CAP_DEG = 20.0
 const TOL = 1e-8
 const NREP = 3
 
+# The NUFFT stage is a co-equal share of an apply and the two backends differ by up to ~2.5x on it,
+# so a single-backend table would be silently backend-specific. Both are swept.
+const NUFFT_BACKENDS = (PF.FINUFFTBackend(), PF.NonuniformFFTsBackend())
+
+loadavg() = try
+    strip(read(`uptime`, String))
+catch
+    "unknown"
+end
+
 function config_line()
-    nufft = PF._resolve_nufft(PF.AutoNUFFT())
-    la = try
-        strip(read(`uptime`, String))
-    catch
-        "unknown"
-    end
-    @printf("config | julia %s | threads %d | BLAS %d | FFTW %d | NUFFT %s | tol %.0e\n",
-            string(VERSION), Threads.nthreads(), LinearAlgebra.BLAS.get_num_threads(),
-            PF.FFTW.get_num_threads(), nameof(typeof(nufft)), TOL)
-    println("       | ", la)
-    println("       | a loaded machine inflates every number below; treat load average > ncpu/2 as noise")
+    Printf.@printf("config | julia %s | threads %d | physical cores %d | BLAS %d | FFTW %d | tol %.0e\n",
+            string(VERSION), Threads.nthreads(), Sys.CPU_THREADS ÷ 2,
+            LinearAlgebra.BLAS.get_num_threads(), PF.FFTW.get_num_threads(), TOL)
+    Printf.@printf("       | NUFFT backends swept: %s\n",
+            join(string.(nameof.(typeof.(NUFFT_BACKENDS))), ", "))
+    println("       | at start: ", loadavg())
+    println("       | a loaded machine inflates every number below; treat load average > ncpu/2")
+    println("       | as noise, and compare the start and end lines before quoting anything")
     println()
-    return nufft
 end
 
 cap_points(n, θstar) = (θstar .* sqrt.(rand(n)), 2π .* rand(n))
@@ -95,7 +102,7 @@ function run_L(L, nufft)
         ft = zeros(ComplexF64, M)
         tt = best(() -> LinearAlgebra.mul!(ft, pt, alm))
         maximum(abs.(ft .- f)) == 0 ||
-            @printf("    WARNING: threaded result differs from serial at L=%d\n", L)
+            Printf.@printf("    WARNING: threaded result differs from serial at L=%d\n", L)
     end
     leaf = ps.leaf
     st = stage_times(leaf, alm3)
@@ -111,21 +118,22 @@ function run_L(L, nufft)
         tn = best(() -> NUFSHT.nusht_type2!(fn, C, np))
         NUFSHT.close!(np)
     catch err
-        @printf("    NUFSHT baseline unavailable at L=%d: %s\n", L, sprint(showerror, err))
+        Printf.@printf("    NUFSHT baseline unavailable at L=%d: %s\n", L, sprint(showerror, err))
     end
 
-    @printf("L=%5d M=%8d | leaf: K=%4d nth=%5d nphi=%5d ring_work=%.3e\n",
-            L, M, leaf.geomθ.K, leaf.nθ, leaf.nφ, Float64(PF.ring_work(ps)))
-    @printf("            | stretch  setup %7.3f s   synth %8.4f s   adj %8.4f s   threaded %8.4f s (%.2fx)\n",
+    Printf.@printf("L=%5d M=%8d %-18s | leaf: K=%4d nth=%5d nphi=%5d ring_work=%.3e\n",
+            L, M, string(nameof(typeof(nufft))), leaf.geomθ.K, leaf.nθ, leaf.nφ,
+            Float64(PF.ring_work(ps)))
+    Printf.@printf("            | stretch  setup %7.3f s   synth %8.4f s   adj %8.4f s   threaded %8.4f s (%.2fx)\n",
             ts_setup, ts, ta, tt, ts / tt)
-    @printf("            |   stages ring %7.4f (thr %7.4f, %.2fx)  phi %7.4f  dfs %7.4f  fft %7.4f  nufft %7.4f\n",
+    Printf.@printf("            |   stages ring %7.4f (thr %7.4f, %.2fx)  phi %7.4f  dfs %7.4f  fft %7.4f  nufft %7.4f\n",
             st.ring, st.ring_thr, st.ring / st.ring_thr, st.phi, st.dfs, st.fft, st.nufft)
     if isfinite(tn)
-        @printf("            | NUFSHT   setup %7.3f s   synth %8.4f s   -> speedup %6.2fx\n",
+        Printf.@printf("            | NUFSHT   setup %7.3f s   synth %8.4f s   -> speedup %6.2fx\n",
                 tn_setup, tn, tn / ts)
     end
     println()
-    return (L = L, M = M, ts = ts, ta = ta, tt = tt, tn = tn,
+    return (L = L, M = M, ts = ts, ta = ta, tt = tt, tn = tn, nufft = nufft,
             ring_work = PF.ring_work(ps), stages = st)
 end
 
@@ -135,7 +143,7 @@ function calibrate_constants(rows)
     isempty(rs) && return nothing
     ring = sum(t for (t, w) in rs) / sum(Float64(w) for (t, w) in rs)
     println("="^92)
-    @printf("measured ring cost: %.3e s per retained (l,m,ring) triple\n", ring)
+    Printf.@printf("measured ring cost: %.3e s per retained (l,m,ring) triple\n", ring)
     println("install with: PartialFSHT.set_cost_constants!(ring = <s/triple>, …)")
     println("="^92)
     return ring
@@ -145,26 +153,33 @@ function main()
     println("="^92)
     println("PartialFSHT calibration — $(CAP_DEG)° polar cap, M ≈ 4(L·θ⋆)²")
     println("="^92)
-    nufft = config_line()
+    config_line()
     rows = Any[]
-    for L in (256, 512, 1024, 2048)
-        try
-            push!(rows, run_L(L, nufft))
-        catch err
-            @printf("L=%d failed: %s\n\n", L, sprint(showerror, err))
+    for nufft in NUFFT_BACKENDS
+        for L in (256, 512, 1024, 2048)
+            try
+                push!(rows, run_L(L, nufft))
+            catch err
+                Printf.@printf("L=%d (%s) failed: %s\n\n", L, nameof(typeof(nufft)),
+                        sprint(showerror, err))
+            end
         end
     end
     calibrate_constants(rows)
     println()
     println("summary (synthesis):")
-    @printf("%6s %10s %12s %12s %12s %10s %10s\n",
-            "L", "M", "serial s", "threaded s", "NUFSHT s", "vs serial", "vs threaded")
+    Printf.@printf("%6s %10s %-18s %12s %12s %12s %10s %10s\n",
+            "L", "M", "NUFFT", "serial s", "threaded s", "NUFSHT s", "vs serial",
+            "vs threaded")
     for r in rows
-        @printf("%6d %10d %12.4f %12.4f %12s %10s %10s\n", r.L, r.M, r.ts, r.tt,
-                isfinite(r.tn) ? @sprintf("%.4f", r.tn) : "-",
-                isfinite(r.tn) ? @sprintf("%.2fx", r.tn / r.ts) : "-",
-                isfinite(r.tn) ? @sprintf("%.2fx", r.tn / r.tt) : "-")
+        Printf.@printf("%6d %10d %-18s %12.4f %12.4f %12s %10s %10s\n", r.L, r.M,
+                string(nameof(typeof(r.nufft))), r.ts, r.tt,
+                isfinite(r.tn) ? Printf.@sprintf("%.4f", r.tn) : "-",
+                isfinite(r.tn) ? Printf.@sprintf("%.2fx", r.tn / r.ts) : "-",
+                isfinite(r.tn) ? Printf.@sprintf("%.2fx", r.tn / r.tt) : "-")
     end
+    println()
+    println("       | at end: ", loadavg())
     return rows
 end
 

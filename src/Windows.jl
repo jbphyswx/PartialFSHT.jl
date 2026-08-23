@@ -1,39 +1,16 @@
-"""
-Apodisation and the stretched bandlimit.
-
-A degree-`lmax` field restricted to a colatitude interval is periodised by multiplying with a
-window that is identically one on the data and falls to zero at the boundary of the period.
-The window is an exponential-of-semicircle (ES) bell convolved with a top-hat — the ES kernel
-of Barnett, Magland & af Klinteberg, SISC 41 (2019), as used inside FINUFFT — and the whole
-construction is fixed by one derived consistency relation, below.
-
-## Derivation of `εapo`, `σ` and `K`
-
-Let the data occupy a colatitude interval of half-extent `h`, padded by a factor `1 + εapo`,
-so the period in `θ` is `P = 2h(1 + εapo)`. Map it to `Θ ∈ [0, 2π)`. Then
-
-* `e^{ikθ}` becomes `Θ`-frequency `kP/(2π)`, so a degree-`lmax` field carries
-  `|Θ-freq| ≤ lmax·P/(2π)`;
-* the data's image is `|Θ - Θc| ≤ Θ1` with `Θ1 = 2πh/P = π/(1 + εapo)`;
-* the window must be one there and zero at the period boundary, which forces the ES half-width
-  `σ = (π - Θ1)/2` and the top-hat half-width `ΘT = Θ1 + σ`;
-* an ES kernel of shape parameter `β` and half-width `σ` has spectral support `≲ β/σ` and
-  residual `~e^{-β}`, so `β = |ln ε|` and the windowed product needs bandwidth
-  `K = lmax·P/(2π) + β/σ`.
-
-Substituting `σ` and `P` gives `K = (1+εapo)/π · [lmax·h + 2β/εapo]`, which collapses to
-
-    εapo = √(2β / (lmax·h)),        K = lmax·h(1 + εapo)² / π
-
-exactly when the window's spectral spread is what the extra bandwidth allowance pays for. This
-reproduces Carron & Reinecke's `εapo` and `L_max`, and shows what they are: the unique choice
-making apodisation cost and bandwidth budget consistent at tolerance `ε`.
-
-The relation is only meaningful for `εapo < 1`; `εapo ≥ 1` means the padding is wider than the
-data, the "interval" balloons, and the construction is degenerate. That is
-`lmax·h ≤ 2|ln ε|`, and it is an error rather than a silent clamp — it is exactly the regime
-in which a stretched transform should not be used at all.
-"""
+# Apodisation and the stretched bandlimit.
+#
+# A degree-lmax field on a colatitude interval is periodised by multiplying with a window that is
+# identically one on the data and falls to zero at the period boundary: an exponential-of-semicircle
+# bell convolved with a top-hat (Barnett, Magland & af Klinteberg, SISC 41, 2019).
+#
+# One derived relation fixes the whole construction,
+#
+#     εapo = √(2β / (lmax·h)),        K = lmax·h(1 + εapo)² / π,       β = |ln ε|
+#
+# and it is only meaningful for εapo < 1. Past that the padding is wider than the data and the
+# construction is refused rather than silently clamped. The derivation is in the manual under
+# Theory ("Apodisation and the stretched bandlimit").
 
 # Largest apodisation fraction the construction is used at. `εapo ≥ 1` means the padding is
 # wider than the data, at which point the interval balloons and a direct evaluation is the
@@ -88,6 +65,24 @@ i.e. when apodisation would be wider than the data.
 """
 function stretch_geometry(θlo::Real, θhi::Real, lmax::Integer, ε::Real;
                           εapo_max::Real = _EPS_APO_MAX)
+    g = try_stretch_geometry(θlo, θhi, lmax, ε; εapo_max = εapo_max)
+    g === nothing && throw(ArgumentError(
+        "stretched transform is degenerate for θ ∈ [$θlo, $θhi] at lmax = $lmax, tol = $ε: every " *
+        "periodisation needs εapo > $(εapo_max), i.e. an apodisation comparable to the " *
+        "data extent, where this construction stops delivering the requested tolerance. Use a " *
+        "direct evaluation for a patch this small at this bandlimit, or raise lmax / loosen tol."))
+    return g
+end
+
+"""
+    try_stretch_geometry(θlo, θhi, lmax, ε; εapo_max) -> StretchGeometry or nothing
+
+[`stretch_geometry`](@ref) as a query: `nothing` where that would throw. The cost model needs to
+ask whether a stretched leaf is admissible for a candidate box without treating "not admissible"
+as an error, and without a `catch` that would also swallow a genuinely bad argument.
+"""
+function try_stretch_geometry(θlo::Real, θhi::Real, lmax::Integer, ε::Real;
+                              εapo_max::Real = _EPS_APO_MAX)
     T = float(promote_type(typeof(float(θlo)), typeof(float(θhi))))
     L = Int(lmax)
     lo, hi = T(θlo), T(θhi)
@@ -95,6 +90,9 @@ function stretch_geometry(θlo::Real, θhi::Real, lmax::Integer, ε::Real;
     (lo >= 0 && hi <= T(π)) || throw(ArgumentError("colatitudes must lie in [0, π]"))
     β = T(es_beta(ε))
     tiny = sqrt(eps(T))
+    # `Z = ∫ES` depends only on β, so it is formed once rather than per surviving candidate.
+    Z = es_cdf(β, T(π) / 2)
+    invZ = Z > 0 ? one(T) / Z : zero(T)
 
     if lo <= tiny && hi >= T(π) - tiny
         return StretchGeometry{T}(:full, L, T(ε), β, T(π) / 2, zero(T), T(π),
@@ -135,17 +133,10 @@ function stretch_geometry(θlo::Real, θhi::Real, lmax::Integer, ε::Real;
             bestK = K
             Θ1 = T(π) / (1 + εapo)
             σ = (T(π) - Θ1) / 2
-            Z = es_cdf(β, T(π) / 2)
             best = StretchGeometry{T}(kind, L, T(ε), β, h, klo, khi, εapo,
-                                      2 * h * (1 + εapo), K, Θ1, σ, Θ1 + σ,
-                                      Z > 0 ? one(T) / Z : zero(T))
+                                      2 * h * (1 + εapo), K, Θ1, σ, Θ1 + σ, invZ)
         end
     end
-    best === nothing && throw(ArgumentError(
-        "stretched transform is degenerate for θ ∈ [$lo, $hi] at lmax = $L, tol = $ε: every " *
-        "periodisation needs εapo > $(εapo_max), i.e. an apodisation comparable to the " *
-        "data extent, where this construction stops delivering the requested tolerance. Use a " *
-        "direct evaluation for a patch this small at this bandlimit, or raise lmax / loosen tol."))
     return best
 end
 

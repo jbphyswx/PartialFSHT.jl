@@ -1,6 +1,4 @@
-"""
-Double Fourier Sphere periodization (Merilees 1973; Townsend & Olver 2015).
-"""
+# Double Fourier Sphere periodisation (Merilees 1973; Townsend & Olver 2015).
 
 """
     dfs_double!(F̃, F) -> F̃
@@ -58,12 +56,15 @@ function dfs_fold!(F::AbstractArray, F̃::AbstractArray, s::Integer)
 end
 
 """
-    dfs_grid_coords(Nθ, Nφ) -> (θ, φ)
+    dfs_grid_coords([T=Float64], Nθ, Nφ) -> (θ, φ)
 
-Equiangular CC nodes: `θ_i = π(i-1/2)/Nθ`, `φ_j = 2π(j-1)/Nφ`.
+Equiangular CC nodes: `θ_i = π(i-1/2)/Nθ`, `φ_j = 2π(j-1)/Nφ`, in element type `T`.
 """
-function dfs_grid_coords(Nθ::Integer, Nφ::Integer)
-    θ = [π * (i - 0.5) / Nθ for i in 1:Int(Nθ)]
-    φ = [2π * (j - 1) / Nφ for j in 1:Int(Nφ)]
+function dfs_grid_coords(::Type{T}, Nθ::Integer, Nφ::Integer) where {T<:AbstractFloat}
+    nθ, nφ = Int(Nθ), Int(Nφ)
+    θ = T[T(π) * (T(i) - T(1) / 2) / T(nθ) for i in 1:nθ]
+    φ = T[2 * T(π) * T(j - 1) / T(nφ) for j in 1:nφ]
     return θ, φ
 end
+
+dfs_grid_coords(Nθ::Integer, Nφ::Integer) = dfs_grid_coords(Float64, Nθ, Nφ)

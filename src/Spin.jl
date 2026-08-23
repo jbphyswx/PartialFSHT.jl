@@ -1,30 +1,23 @@
-"""
-Spin-weighted transforms.
-
-    ₛY_{ℓm}(θ,φ) = N_ℓ d^ℓ_{m,−s}(θ) e^{imφ},      N_ℓ = √((2ℓ+1)/4π)
-
-The Wigner-`d` here is *not* a rotation — it is the spin analogue of an associated Legendre
-function, a three-term recurrence in degree at fixed `(m, −s)`. Treating it as a rotation is
-what made the previous spin path `O(L³)` per apply with a `cis` in the innermost loop and a
-`(2L+1)²` scratch array (268 MB at `lmax = 2048`).
-
-The degree recurrence is
-
-    d^{ℓ+1}_{m'm} = (2ℓ+1)[ℓ(ℓ+1)cosβ − m'm] / (ℓ √((ℓ+1)²−m'²) √((ℓ+1)²−m²)) · d^ℓ_{m'm}
-                  − (ℓ+1)√(ℓ²−m'²)√(ℓ²−m²) / (ℓ √((ℓ+1)²−m'²) √((ℓ+1)²−m²)) · d^{ℓ−1}_{m'm}
-
-seeded at `ℓ₀ = max(|m'|,|m|)`, where the `d^{ℓ₀−1}` coefficient vanishes identically, from the
-extremal closed form. Summing the Edmonds/Wikipedia series at the extremal index leaves a
-single term and gives
-
-    d^ℓ_{m,ℓ}(β)  = √C(2ℓ, ℓ−m) cos^{ℓ+m}(β/2) sin^{ℓ−m}(β/2)
-    d^ℓ_{m,−ℓ}(β) = (−1)^{ℓ−m} √C(2ℓ, ℓ−m) cos^{ℓ−m}(β/2) sin^{ℓ+m}(β/2)
-
-(checked against the closed `ℓ = 1` values). Both seeds are formed in log space and the
-recurrence is block-scaled exactly as in [`alf`](@ref), so `sin^{ℓ+m}(β/2)` never underflows and
-the result is correct at any degree the exponent range admits — the previous factorial sum was
-silently wrong above `ℓ ≈ 40`.
-"""
+# Spin-weighted transforms.
+#
+#     ₛY_{ℓm}(θ,φ) = N_ℓ d^ℓ_{m,−s}(θ) e^{imφ},      N_ℓ = √((2ℓ+1)/4π)
+#
+# The Wigner-d here is NOT a rotation. It is the spin analogue of an associated Legendre function:
+# a three-term recurrence in *degree* at fixed (m, −s),
+#
+#     d^{ℓ+1}_{m'm} = (2ℓ+1)[ℓ(ℓ+1)cosβ − m'm] / (ℓ √((ℓ+1)²−m'²) √((ℓ+1)²−m²)) · d^ℓ_{m'm}
+#                   − (ℓ+1)√(ℓ²−m'²)√(ℓ²−m²) / (ℓ √((ℓ+1)²−m'²) √((ℓ+1)²−m²)) · d^{ℓ−1}_{m'm}
+#
+# seeded at ℓ₀ = max(|m'|,|m|), where the d^{ℓ₀−1} coefficient vanishes identically, from the
+# extremal closed form
+#
+#     d^ℓ_{m,ℓ}(β)  = √C(2ℓ, ℓ−m) cos^{ℓ+m}(β/2) sin^{ℓ−m}(β/2)
+#     d^ℓ_{m,−ℓ}(β) = (−1)^{ℓ−m} √C(2ℓ, ℓ−m) cos^{ℓ−m}(β/2) sin^{ℓ+m}(β/2)
+#
+# and block-scaled exactly as `alf`, so sin^{ℓ+m}(β/2) never underflows. Both the log-binomial and
+# the two exponents depend only on the order and the two logarithms only on the ring, so the whole
+# seed is tabulated at construction (see `SpinRings`) — the closed form costs three `loggamma` calls
+# and two `log`s, which is not something an apply should pay per (order, ring).
 
 @inline _Nℓ(::Type{T}, ℓ::Integer) where {T} = sqrt(T(2 * Int(ℓ) + 1) / (4 * T(π)))
 
@@ -153,7 +146,9 @@ end
 # Spin ring engine: d^ℓ_{m,-s}(θ_j) contracted against spin coefficients
 # ---------------------------------------------------------------------------------------
 
-"""Recurrence state and partial sums for one ring chunk of the spin walk; one per task slot."""
+"""
+Recurrence state and partial sums for one ring chunk of the spin walk; one per task slot.
+"""
 struct SpinScratch{T<:AbstractFloat, CT<:Complex, VT<:AbstractVector{T}, MT<:AbstractMatrix{CT}}
     d1::VT
     d0::VT
@@ -166,64 +161,159 @@ end
 Ring-oriented spin transform: the same chunked, block-scaled walk as [`RingLegendre`](@ref)
 with the degree recurrence for `d^ℓ_{m,−s}` in place of the associated-Legendre one. Polar
 optimisation still applies, but never below `|m| = |s|`, since `d^ℓ_{m,−s}` is not small there.
+
+The extremal seed is `√C(2ℓ₀, ℓ₀−a) cos^{p_c}(θ/2) sin^{p_s}(θ/2)` with `ℓ₀ = max(|m|,|s|)`. Both
+the log-binomial and the two exponents depend only on the order, and the two logarithms only on
+the ring, so all of it is tabulated here: the apply then forms a seed with two multiply-adds
+instead of the three `loggamma` calls and two `log`s the closed form needs.
 """
-struct SpinRings{T<:AbstractFloat, CT<:Complex, VT<:AbstractVector{T}, MT<:AbstractMatrix{CT}}
+struct SpinRings{T<:AbstractFloat, CT<:Complex, VT<:AbstractVector{T}, VI<:AbstractVector{Int},
+                 SC}
     lmax::Int
     spin::Int
     ntrans::Int
     ε::T
     θ::VT
     cosθ::VT
-    mlim::Vector{Int}
-    jlo::Vector{Int}
+    log2cos_h::VT         # log2 cos(θ_j/2)
+    log2sin_h::VT         # log2 sin(θ_j/2)
+    Nℓ::VT                # √((2ℓ+1)/4π), ℓ = 0:lmax
+    seed_lb2::VT          # ½ log2 C(2ℓ₀, ℓ₀−a) per order
+    seed_pc::VI           # cos(θ/2) exponent per order
+    seed_ps::VI           # sin(θ/2) exponent per order
+    seed_sgn::VT
+    mlim::VI              # follows the node array type, so a device kernel can read it
+    jlo::Vector{Int}      # host-side loop bounds
     jhi::Vector{Int}
     chunks::Vector{UnitRange{Int}}
-    slots::Vector{SpinScratch{T, CT, VT, MT}}
+    slots::Vector{SC}
 end
 
 nslots(eng::SpinRings) = length(eng.slots)
 
 function SpinRings(θ::AbstractVector, lmax::Integer, spin::Integer, ε::Real;
                    ntrans::Integer = 1, CT::Type = Complex{float(eltype(θ))},
-                   slots::Integer = max(1, Threads.nthreads()))
+                   slots::Integer = max(1, Threads.nthreads()),
+                   reflect::Bool = false)
     T = float(eltype(θ))
     L = Int(lmax)
     s = Int(spin)
     B = Int(ntrans)
-    issorted(θ) || throw(ArgumentError("ring colatitudes must be sorted ascending"))
+    B >= 1 || throw(ArgumentError("ntrans must be ≥ 1"))
     nθ = length(θ)
-    mlim = [max(polar_mmax(T(θ[j]), L, ε), abs(s)) for j in 1:nθ]
-    jlo = fill(1, 2L + 1)
-    jhi = fill(0, 2L + 1)
-    @inbounds for (idx, m) in enumerate(-L:L)
-        lo, hi = 0, -1
-        for j in 1:nθ
-            if mlim[j] >= abs(m)
-                lo == 0 && (lo = j)
-                hi = j
-            end
-        end
-        jlo[idx] = lo == 0 ? 1 : lo
-        jhi[idx] = hi
-    end
-    chunks = UnitRange{Int}[]
-    i = 1
-    while i <= nθ
-        stop = min(i + _CHUNK_MAX - 1, nθ)
-        push!(chunks, i:stop)
-        i = stop + 1
-    end
-    cw = maximum(length, chunks)
-    cosθ = similar(θ, T)
+    nθ >= 1 || throw(ArgumentError("need at least one ring"))
+
+    # Geometry is host work — plan-time and O(nθ + L) — then transferred once. The sortedness
+    # check runs on the host copy for the same reason.
+    θh = T.(_host(θ))
+    issorted(θh) || throw(ArgumentError("ring colatitudes must be sorted ascending"))
+    cosθ_h = similar(θh)
+    log2cos_h = similar(θh)
+    log2sin_h = similar(θh)
+    # `reflect` means the physical colatitudes are `π .- θ` for the ascending `θ` given. Then
+    # `cos θ → -cos θ`, and the two half-angle factors swap: `cos((π-θ)/2) = sin(θ/2)`. Nothing
+    # else moves — `sin(π-θ) = sin θ` leaves the polar-optimisation limits alone — so the
+    # reflection identity `ₛY_{ℓm}(π-θ,φ) = (-1)^{ℓ+m} ₋ₛY_{ℓm}(θ,φ)` is realised here at zero
+    # cost, with the *original* spin weight and no pass over the coefficients.
+    csgn = reflect ? -one(T) : one(T)
     @inbounds for j in 1:nθ
-        cosθ[j] = cos(T(θ[j]))
+        t = θh[j]
+        cosθ_h[j] = csgn * cos(t)
+        ch, sh = cos(t / 2), abs(sin(t / 2))
+        reflect && ((ch, sh) = (sh, ch))
+        log2cos_h[j] = ch > 0 ? log2(ch) : T(-Inf)
+        log2sin_h[j] = sh > 0 ? log2(sh) : T(-Inf)
     end
+
+    mlim = Vector{Int}(undef, nθ)
+    @inbounds for j in 1:nθ
+        mlim[j] = max(polar_mmax(θh[j], L, ε), abs(s))
+    end
+    jlo, jhi = _nested_ranges(mlim, L, true)
+
+    # Seed tables. ℓ₀ = max(|m|,|s|); whichever index is extremal moves into second place via
+    # d^ℓ_{a,b} = (−1)^{a−b} d^ℓ_{b,a}, so the surviving free index `a` is m when |s| ≥ |m| and
+    # −s otherwise. Both branches are a function of the order alone.
+    n = -s
+    inv_ln2 = one(T) / log(T(2))
+    lb2 = Vector{T}(undef, 2L + 1)
+    pc = Vector{Int}(undef, 2L + 1)
+    ps = Vector{Int}(undef, 2L + 1)
+    sg = Vector{T}(undef, 2L + 1)
+    @inbounds for (idx, m) in enumerate(-L:L)
+        l0 = max(abs(m), abs(n))
+        if l0 > L
+            lb2[idx] = T(-Inf); pc[idx] = 0; ps[idx] = 0; sg[idx] = one(T)
+            continue
+        end
+        # (a, b): b is the extremal second index, a the free first index.
+        if abs(n) == l0
+            a, b, extra = m, (n == l0 ? l0 : -l0), one(T)
+        else
+            a, b, extra = n, (m == l0 ? l0 : -l0), (isodd(n - m) ? -one(T) : one(T))
+        end
+        if b == l0
+            pc[idx], ps[idx], sgn = l0 + a, l0 - a, one(T)
+        else
+            pc[idx], ps[idx], sgn = l0 - a, l0 + a, (iseven(l0 - a) ? one(T) : -one(T))
+        end
+        lb2[idx] = _half_lbinom(T, l0, a) * inv_ln2
+        sg[idx] = sgn * extra
+    end
+
+    chunks = _spin_ring_chunks(log2cos_h, log2sin_h, mlim, abs(s))
+    cw = min(_CHUNK_MAX, maximum(length, chunks))
+
+    Nℓ_h = Vector{T}(undef, L + 1)
+    @inbounds for ℓ in 0:L
+        Nℓ_h[ℓ + 1] = _Nℓ(T, ℓ)
+    end
+
+    cosθ = _to_like(θ, cosθ_h)
     VT = typeof(cosθ)
     MT = typeof(similar(θ, CT, cw, B))
     sl = [SpinScratch{T, CT, VT, MT}(similar(θ, T, cw), similar(θ, T, cw),
-                                     similar(θ, CT, cw, B)) for _ in 1:max(1, Int(slots))]
-    return SpinRings{T, CT, VT, MT}(
-        L, s, B, T(ε), θ, cosθ, mlim, jlo, jhi, chunks, sl)
+                                     similar(θ, CT, cw, B))
+          for _ in 1:max(1, Int(slots))]
+    mlim_dev = _to_like(θ, mlim)
+    return SpinRings{T, CT, VT, typeof(mlim_dev), eltype(sl)}(
+        L, s, B, T(ε), _to_like(θ, θh), cosθ, _to_like(θ, log2cos_h), _to_like(θ, log2sin_h),
+        _to_like(θ, Nℓ_h), _to_like(θ, lb2), _to_like(θ, pc), _to_like(θ, ps), _to_like(θ, sg),
+        mlim_dev, jlo, jhi, chunks, sl)
+end
+
+"""
+Split spin rings into chunks sharing one scale exponent.
+
+The seed's ring dependence is `p_c log₂cos(θ/2) + p_s log₂sin(θ/2)` with `p_c + p_s = 2ℓ₀`, so the
+spread across a chunk is bounded by `2ℓ₀` times the larger of the two log ratios. Splitting on that
+bound is what keeps renormalising against the chunk maximum from flushing the smallest ring to
+zero — with a fixed block size instead, a ring whose true `d^ℓ_{m,−s}` is well inside tolerance
+comes back as exactly `0.0` (measured at `lmax = 128`, `m = 96`).
+"""
+function _spin_ring_chunks(log2cos::AbstractVector{T}, log2sin::AbstractVector{T},
+                           mlim::Vector{Int}, absspin::Int) where {T}
+    n = length(log2cos)
+    chunks = UnitRange{Int}[]
+    i = 1
+    @inbounds while i <= n
+        stop = i
+        l0max = max(mlim[i], absspin)
+        while stop < n
+            nxt = stop + 1
+            nxt - i + 1 > _CHUNK_MAX && break
+            spanc = abs(log2cos[nxt] - log2cos[i])
+            spans = abs(log2sin[nxt] - log2sin[i])
+            span = max(isfinite(spanc) ? spanc : T(Inf), isfinite(spans) ? spans : T(Inf))
+            l0 = max(l0max, mlim[nxt], absspin)
+            2 * l0 * span > _CHUNK_HEADROOM_BITS && break
+            l0max = l0
+            stop = nxt
+        end
+        push!(chunks, i:stop)
+        i = stop + 1
+    end
+    return chunks
 end
 
 """
@@ -271,6 +361,19 @@ function _spin_walk_orders!(dir, G, alm, eng::SpinRings, ms, sc::SpinScratch)
     return nothing
 end
 
+"""
+Seed exponent `log₂|d^{ℓ₀}_{m,−s}(θ_j)|` from the tabulated log-binomial and the two tabulated
+per-ring logarithms. The `p == 0` guards are what make the poles exact: at `θ = 0` the only
+surviving order has `p_s = 0` *and* a vanishing log-binomial, so the seed is exactly one and the
+rest are exactly zero, with no endpoint special case.
+"""
+@inline function _spin_seed_log2(eng::SpinRings{T}, j::Int, lb2::T, pc::Int, ps::Int) where {T}
+    e = lb2
+    @inbounds pc != 0 && (e += T(pc) * eng.log2cos_h[j])
+    @inbounds ps != 0 && (e += T(ps) * eng.log2sin_h[j])
+    return e
+end
+
 function _spin_chunk!(dir, G, alm, eng::SpinRings{T, CT}, m::Int,
                       r::UnitRange{Int}, sc::SpinScratch) where {T, CT}
     L = eng.lmax
@@ -284,18 +387,16 @@ function _spin_chunk!(dir, G, alm, eng::SpinRings{T, CT}, m::Int,
     d0 = view(sc.d0, 1:nr)
     acc = view(sc.acc, 1:nr, 1:B)
 
-    # Shared seed exponent across the chunk. `_spin_seed_log` returns a natural log; the scale
-    # is a power of two, so convert before rounding.
-    ln2 = log(T(2))
+    mi = m + L + 1
+    @inbounds lb2, pc, ps, sg = eng.seed_lb2[mi], eng.seed_pc[mi], eng.seed_ps[mi], eng.seed_sgn[mi]
     E = T(-Inf)
     @inbounds for j in r
-        lg, _ = _spin_seed_log(T, l0, m, n, T(eng.θ[j]))
-        E = max(E, lg)
+        E = max(E, _spin_seed_log2(eng, j, lb2, pc, ps))
     end
-    E = isfinite(E) ? ceil(E / ln2) : zero(T)
+    E = isfinite(E) ? ceil(E) : zero(T)
     @inbounds for (k, j) in enumerate(r)
-        lg, sg = _spin_seed_log(T, l0, m, n, T(eng.θ[j]))
-        d1[k] = isfinite(lg) ? sg * exp(lg - E * ln2) : zero(T)
+        e = _spin_seed_log2(eng, j, lb2, pc, ps)
+        d1[k] = isfinite(e) ? sg * exp2(e - E) : zero(T)
         d0[k] = zero(T)
     end
 
@@ -307,7 +408,7 @@ function _spin_chunk!(dir, G, alm, eng::SpinRings{T, CT}, m::Int,
         end
     end
 
-    _spin_touch!(dir, alm, acc, d1, l0, m, L, B, nr, E)
+    _spin_touch!(dir, alm, acc, d1, l0, m, L, B, nr, E, eng)
 
     steps = 0
     Lc = l0
@@ -330,10 +431,13 @@ function _spin_chunk!(dir, G, alm, eng::SpinRings{T, CT}, m::Int,
         a2 = T(2 * Lc + 1) * T(m) * T(n) / den
         a0 = T(L1) * sm0 * sn0 / den
         cs = view(eng.cosθ, r)
-        # Same fusion as the scalar ring pass: consume the new `d` in the register that produced
-        # it. Worth ~1.25× there, and the recurrence here has the same shape.
-        if dir isa _Fwd && B == 1 && abs(m) <= L1
-            av = _spin_coeff(alm, L1, m, L, 1) * _Nℓ(T, L1)
+        @inbounds N1 = eng.Nℓ[L1 + 1]
+        # Single transform: fuse the recurrence with its accumulation so the new `d` is consumed in
+        # the register that produced it. Batched transforms do NOT fuse — that would put the batch
+        # loop innermost, where `acc[k, b]` strides by `nr`, and the strided inner loop costs more
+        # than the fusion saves (measured 0.64x at `ntrans = 2` in the scalar pass, same shape).
+        if dir isa _Fwd && B == 1
+            @inbounds av = _spin_coeff(alm, L1, m, L, 1) * N1
             if iszero(av)
                 @inbounds @simd for k in 1:nr
                     dn = (a1 * cs[k] - a2) * d1[k] - a0 * d0[k]
@@ -349,8 +453,8 @@ function _spin_chunk!(dir, G, alm, eng::SpinRings{T, CT}, m::Int,
                 end
             end
             Lc = L1
-        elseif dir isa _Adj && B == 1 && abs(m) <= L1
-            s = zero(eltype(alm))
+        elseif dir isa _Adj && B == 1
+            s = zero(CT)
             @inbounds @simd for k in 1:nr
                 dn = (a1 * cs[k] - a2) * d1[k] - a0 * d0[k]
                 d0[k] = d1[k]
@@ -358,7 +462,7 @@ function _spin_chunk!(dir, G, alm, eng::SpinRings{T, CT}, m::Int,
                 s += dn * acc[k, 1]
             end
             Lc = L1
-            _spin_coeff_add!(alm, L1, m, L, 1, s * exp2(E) * _Nℓ(T, L1))
+            @inbounds _spin_coeff_add!(alm, L1, m, L, 1, s * (exp2(E) * N1))
         else
             @inbounds @simd for k in 1:nr
                 dn = (a1 * cs[k] - a2) * d1[k] - a0 * d0[k]
@@ -366,7 +470,7 @@ function _spin_chunk!(dir, G, alm, eng::SpinRings{T, CT}, m::Int,
                 d1[k] = dn
             end
             Lc = L1
-            _spin_touch!(dir, alm, acc, d1, Lc, m, L, B, nr, E)
+            _spin_touch!(dir, alm, acc, d1, Lc, m, L, B, nr, E, eng)
         end
         steps += 1
         if steps == _RESCALE_STRIDE && Lc < L
@@ -403,25 +507,10 @@ function _spin_chunk!(dir, G, alm, eng::SpinRings{T, CT}, m::Int,
     return nothing
 end
 
-function _spin_seed_log(::Type{T}, l0::Int, m::Int, n::Int, β::T) where {T}
-    tiny = sqrt(eps(T))
-    if β <= tiny
-        return m == n ? (zero(T), one(T)) : (T(-Inf), one(T))
-    elseif β >= T(π) - tiny
-        return m == -n ? (zero(T), iseven(l0 - n) ? one(T) : -one(T)) : (T(-Inf), one(T))
-    end
-    if abs(n) == l0
-        return _d_extremal(T, l0, m, n == l0 ? l0 : -l0, β)
-    else
-        lg, sg = _d_extremal(T, l0, n, m == l0 ? l0 : -l0, β)
-        isodd(n - m) && (sg = -sg)
-        return lg, sg
-    end
-end
-
-@inline function _spin_touch!(::_Fwd, alm, acc, d, ℓ::Int, m::Int, L::Int, B::Int, nr::Int, E)
+@inline function _spin_touch!(::_Fwd, alm, acc, d, ℓ::Int, m::Int, L::Int, B::Int, nr::Int, E,
+                              eng::SpinRings)
     abs(m) > ℓ && return nothing
-    N = _Nℓ(real(eltype(acc)), ℓ)
+    @inbounds N = eng.Nℓ[ℓ + 1]
     @inbounds for b in 1:B
         a = _spin_coeff(alm, ℓ, m, L, b) * N
         iszero(a) && continue
@@ -432,10 +521,10 @@ end
     return nothing
 end
 
-@inline function _spin_touch!(::_Adj, alm, acc, d, ℓ::Int, m::Int, L::Int, B::Int, nr::Int, E)
+@inline function _spin_touch!(::_Adj, alm, acc, d, ℓ::Int, m::Int, L::Int, B::Int, nr::Int, E,
+                              eng::SpinRings)
     abs(m) > ℓ && return nothing
-    N = _Nℓ(real(eltype(acc)), ℓ)
-    f = exp2(E) * N
+    @inbounds f = exp2(E) * eng.Nℓ[ℓ + 1]
     @inbounds for b in 1:B
         s = zero(eltype(alm))
         @simd for k in 1:nr
@@ -456,7 +545,7 @@ end
 Direct spin evaluation, `O(M L²)`: the correctness oracle for every spin fast path. Built on
 [`SpinRings`](@ref) with polar optimisation off, so there is one Wigner-`d` implementation.
 """
-struct SpinDirectLeaf{T, CT, EN, A3, VT, VC, VI}
+struct SpinDirectLeaf{T, CT, EN, A3, VT, VI}
     lmax::Int
     ntrans::Int
     spin::Int
@@ -464,26 +553,33 @@ struct SpinDirectLeaf{T, CT, EN, A3, VT, VC, VI}
     G::A3
     perm::VI
     θs::VT
-    eiφ::VC
+    φs::VT
 end
 
 function SpinDirectLeaf(θ::AbstractVector, φ::AbstractVector, lmax::Integer,
                         ntrans::Integer, spin::Integer)
-    T = float(eltype(θ))
+    T = float(promote_type(float(eltype(θ)), float(eltype(φ))))
     CT = Complex{T}
     L = Int(lmax)
     B = Int(ntrans)
-    θh = T.(_host(θ))
-    φh = T.(_host(φ))
-    perm = sortperm(θh)
-    θs_h = θh[perm]
-    eng = SpinRings(θs_h, L, Int(spin), zero(T); ntrans = B, CT = CT)
+    length(θ) == length(φ) || throw(DimensionMismatch("θ and φ must have the same length"))
+    θh = _host(θ)
+    φh = _host(φ)
     n = length(θh)
+    perm = sortperm(θh)
+    θs_h = Vector{T}(undef, n)
+    φs_h = Vector{T}(undef, n)
+    @inbounds for i in 1:n
+        p = perm[i]
+        θs_h[i] = T(θh[p])
+        φs_h[i] = T(φh[p])
+    end
+    eng = SpinRings(θs_h, L, Int(spin), zero(T); ntrans = B, CT = CT)
     G = _zeros_like(θ, CT, n, 2L + 1, B)
     θs = _to_like(θ, θs_h)
-    eiφ = _to_like(θ, CT[cis(φh[perm][i]) for i in 1:n])
-    return SpinDirectLeaf{T, CT, typeof(eng), typeof(G), typeof(θs), typeof(eiφ),
-                          typeof(perm)}(L, B, Int(spin), eng, G, perm, θs, eiφ)
+    φs = _to_like(θ, φs_h)
+    return SpinDirectLeaf{T, CT, typeof(eng), typeof(G), typeof(θs),
+                          typeof(perm)}(L, B, Int(spin), eng, G, perm, θs, φs)
 end
 
 algorithm(::SpinDirectLeaf) = DirectAlgorithm()
@@ -492,16 +588,17 @@ ring_work(::SpinDirectLeaf) = 0
 function synthesize_spin_direct!(f, alm, leaf::SpinDirectLeaf{T, CT}) where {T, CT}
     B = leaf.ntrans
     L = leaf.lmax
+    _assert_coeffs(alm, L, B)
+    _assert_field(f, length(leaf.θs), B)
     spin_rings_from_alm!(leaf.G, alm, leaf.eng)
     n = length(leaf.θs)
     off = L + 1
     fill!(f, zero(eltype(f)))
     @inbounds for b in 1:B, i in 1:n
         acc = leaf.G[i, off, b]
-        e = leaf.eiφ[i]
-        ph = one(CT)
+        φi = leaf.φs[i]
         for m in 1:L
-            ph *= e
+            ph = cis(T(m) * φi)
             acc += leaf.G[i, m + off, b] * ph + leaf.G[i, -m + off, b] * conj(ph)
         end
         _field_set!(f, leaf.perm[i], b, acc)
@@ -512,17 +609,18 @@ end
 function adjoint_spin_direct!(alm, f, leaf::SpinDirectLeaf{T, CT}) where {T, CT}
     B = leaf.ntrans
     L = leaf.lmax
+    _assert_coeffs(alm, L, B)
+    _assert_field(f, length(leaf.θs), B)
     n = length(leaf.θs)
     off = L + 1
     fill!(leaf.G, zero(CT))
     @inbounds for b in 1:B, i in 1:n
         fi = _field_get(f, leaf.perm[i], b)
         iszero(fi) && continue
-        e = leaf.eiφ[i]
+        φi = leaf.φs[i]
         leaf.G[i, off, b] = fi
-        ph = one(CT)
         for m in 1:L
-            ph *= e
+            ph = cis(T(m) * φi)
             leaf.G[i, m + off, b] = fi * conj(ph)
             leaf.G[i, -m + off, b] = fi * ph
         end

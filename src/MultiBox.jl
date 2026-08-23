@@ -1,32 +1,41 @@
+# Several boxes, one transform: for a mask with genuinely disjoint components — two basins, a
+# fragmented paleo-ocean, a set of satellite swaths — each component gets its own stretched-interval
+# leaf, and the results are a disjoint union in synthesis and a sum in the adjoint.
+#
+# The accumulator count is bounded by the *thread* count rather than the box count. One full
+# (lmax+1)×(2lmax+1)×ntrans coefficient buffer per box is 134 MB each at lmax = 2048, so a per-box
+# accumulator turns a transform whose working set should be a few hundred megabytes into gigabytes.
+
 """
-Several boxes, one transform.
+    MultiBoxLeaf
 
-For a mask with genuinely disjoint components — two basins, a fragmented paleo-ocean, a set of
-satellite swaths — each component gets its own stretched-interval leaf and the results are a
-disjoint union in synthesis, a sum in the adjoint.
+One stretched-interval leaf per box of a partitioned point set. Synthesis is a disjoint union over
+boxes, the adjoint a sum.
 
-The accumulator count is bounded by the thread count rather than the box count. The previous
-design held one full `(lmax+1)×(2lmax+1)×ntrans` coefficient buffer *per cluster*, which is
-134 MB each at `lmax = 2048`; thirty-two of those is 4.3 GB of buffers for a transform whose
-working set should be a few hundred megabytes.
+`accs` is per-task scratch, because `adjoint_stretch!` overwrites its output rather than
+accumulating into it; `sums` is each task's running total, reduced once at the end. Both are sized
+by the *thread* count, not the box count — one full coefficient buffer per box is 134 MB each at
+`lmax = 2048`.
 """
-
-struct MultiBoxLeaf{T, LF, VT, A2, A3}
+struct MultiBoxLeaf{T, LF, VT, VP, A2, A3}
     groups::Vector{Vector{Int}}
     leaves::Vector{LF}
     fgs::Vector{A2}
     accs::Vector{A3}   # per-task scratch: `adjoint_stretch!` overwrites its output
     sums::Vector{A3}   # per-task running total, reduced once at the end
     θ::VT
-    φ::VT
+    φ::VP
     lmax::Int
     ntrans::Int
 end
 
 function MultiBoxLeaf(θ::AbstractVector, φ::AbstractVector, lmax::Integer, ntrans::Integer,
                       tol::Real; nufft_backend = DirectSumBackend(), spin::Integer = 0,
-                      groups = nothing, maxboxes::Integer = 8)
-    T = float(eltype(θ))
+                      groups = nothing, maxboxes::Integer = 8,
+                      εapo_max::Real = _EPS_APO_MAX,
+                      oversample_θ::Real = 1, oversample_φ::Real = 1,
+                      fft_threads::Integer = 1, nufft_kwargs::NamedTuple = (;))
+    T = float(promote_type(float(eltype(θ)), float(eltype(φ))))
     CT = Complex{T}
     L = Int(lmax)
     B = Int(ntrans)
@@ -38,14 +47,17 @@ function MultiBoxLeaf(θ::AbstractVector, φ::AbstractVector, lmax::Integer, ntr
 
     θh, φh = _host(θ), _host(φ)
     leaves = [StretchLeaf(view(θh, g), view(φh, g), L, B, tol;
-                          nufft_backend = nufft_backend, spin = Int(spin)) for g in gs]
+                          nufft_backend = nufft_backend, spin = Int(spin),
+                          εapo_max = εapo_max, oversample_θ = oversample_θ,
+                          oversample_φ = oversample_φ, fft_threads = fft_threads,
+                          nufft_kwargs = nufft_kwargs) for g in gs]
     fgs = [_zeros_like(θ, CT, length(g), B) for g in gs]
     nacc = min(length(gs), max(1, Threads.nthreads()))
     nθc, nφc = coeff_size(L)
     accs = [_zeros_like(θ, CT, nθc, nφc, B) for _ in 1:nacc]
     sums = [_zeros_like(θ, CT, nθc, nφc, B) for _ in 1:nacc]
 
-    return MultiBoxLeaf{T, eltype(leaves), typeof(θ), eltype(fgs), eltype(accs)}(
+    return MultiBoxLeaf{T, eltype(leaves), typeof(θ), typeof(φ), eltype(fgs), eltype(accs)}(
         gs, leaves, fgs, accs, sums, θ, φ, L, B)
 end
 

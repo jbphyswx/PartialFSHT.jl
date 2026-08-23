@@ -1,15 +1,10 @@
-"""
-Direct evaluation — the correctness oracle.
-
-`O(M L²)` and intentionally so: this is what every fast path is gated against, so it must be
-right at every degree rather than fast. It reuses the *same* block-scaled recurrence as the
-production ring engine, with polar optimisation switched off, so there is exactly one
-associated-Legendre implementation in the package and the oracle cannot drift from the thing it
-certifies.
-
-Treating each sample point as its own ring turns the oracle into a ring transform followed by a
-per-point azimuthal phase, which is why no separate `O(M L²)` kernel is needed.
-"""
+# Direct evaluation — the correctness oracle. O(M L²) and intentionally so: this is what every fast
+# path is gated against, so it must be right at every degree rather than fast.
+#
+# It reuses the *same* block-scaled recurrence as the production ring engine with polar optimisation
+# switched off, so there is exactly one associated-Legendre implementation in the package and the
+# oracle cannot drift from the thing it certifies. Treating each sample point as its own ring turns
+# the oracle into a ring transform plus a per-point azimuthal phase, so no separate kernel is needed.
 
 """
     DirectLeaf
@@ -17,7 +12,7 @@ per-point azimuthal phase, which is why no separate `O(M L²)` kernel is needed.
 Scratch for [`synthesize_direct!`](@ref) / [`adjoint_direct!`](@ref). Points are sorted by
 colatitude at construction (the ring engine walks ascending `θ`) and scattered back on output.
 """
-struct DirectLeaf{T, CT, EN, A3, VT, VC, VI}
+struct DirectLeaf{T, CT, EN, A3, VT, VI}
     lmax::Int
     ntrans::Int
     eng::EN
@@ -25,33 +20,34 @@ struct DirectLeaf{T, CT, EN, A3, VT, VC, VI}
     perm::VI
     θs::VT
     φs::VT
-    eiφ::VC
-    phase::VC
 end
 
 function DirectLeaf(θ::AbstractVector, φ::AbstractVector, lmax::Integer, ntrans::Integer)
-    T = float(eltype(θ))
+    T = float(promote_type(float(eltype(θ)), float(eltype(φ))))
     CT = Complex{T}
     L = Int(lmax)
     B = Int(ntrans)
     length(θ) == length(φ) || throw(DimensionMismatch("θ and φ must have the same length"))
-    θh = T.(_host(θ))
-    φh = T.(_host(φ))
+    θh = _host(θ)
+    φh = _host(φ)
+    n = length(θh)
     perm = sortperm(θh)
-    θs_h = θh[perm]
-    φs_h = φh[perm]
+    θs_h = Vector{T}(undef, n)
+    φs_h = Vector{T}(undef, n)
+    @inbounds for i in 1:n
+        p = perm[i]
+        θs_h[i] = T(θh[p])
+        φs_h[i] = T(φh[p])
+    end
 
     # ε = 0 asks polar_mmax for no truncation at all: the oracle keeps every order.
     eng = RingLegendre(θs_h, L, zero(T); ntrans = B, CT = CT)
 
-    n = length(θh)
     G = _zeros_like(θ, CT, n, 2L + 1, B)
     θs = _to_like(θ, θs_h)
     φs = _to_like(θ, φs_h)
-    eiφ = _to_like(θ, CT[cis(p) for p in φs_h])
-    phase = _to_like(θ, Vector{CT}(undef, n))
-    return DirectLeaf{T, CT, typeof(eng), typeof(G), typeof(θs), typeof(eiφ), typeof(perm)}(
-        L, B, eng, G, perm, θs, φs, eiφ, phase)
+    return DirectLeaf{T, CT, typeof(eng), typeof(G), typeof(θs), typeof(perm)}(
+        L, B, eng, G, perm, θs, φs)
 end
 
 algorithm(::DirectLeaf) = DirectAlgorithm()
@@ -70,13 +66,17 @@ function synthesize_direct!(f, alm, leaf::DirectLeaf{T, CT}) where {T, CT}
     n = length(leaf.θs)
     off = L + 1
     fill!(f, zero(eltype(f)))
+    # The azimuthal phase is formed exactly per order rather than as a running product. A running
+    # `ph *= cis(φ)` drifts by `O(L·eps)` in both argument and modulus — 1.3e-13 at lmax = 4096 —
+    # and this is the reference the fast paths are asserted against at round-off level, so it
+    # cannot carry an error that grows with the bandlimit. One `sincos` per (point, order) is ~1%
+    # of an `O(M L²)` oracle.
     @inbounds for b in 1:B
         for i in 1:n
             acc = leaf.G[i, off, b]
-            e = leaf.eiφ[i]
-            ph = one(CT)
+            φi = leaf.φs[i]
             for m in 1:L
-                ph *= e
+                ph = cis(T(m) * φi)
                 acc += leaf.G[i, m + off, b] * ph + leaf.G[i, -m + off, b] * conj(ph)
             end
             _field_set!(f, leaf.perm[i], b, acc)
@@ -103,11 +103,10 @@ function adjoint_direct!(alm, f, leaf::DirectLeaf{T, CT}) where {T, CT}
         for i in 1:n
             fi = _field_get(f, leaf.perm[i], b)
             iszero(fi) && continue
-            e = leaf.eiφ[i]
+            φi = leaf.φs[i]
             leaf.G[i, off, b] = fi
-            ph = one(CT)
             for m in 1:L
-                ph *= e
+                ph = cis(T(m) * φi)
                 leaf.G[i, m + off, b] = fi * conj(ph)
                 leaf.G[i, -m + off, b] = fi * ph
             end

@@ -24,6 +24,12 @@ coefficients already define the field everywhere, and the DFS extension of a deg
 an exact 2-D trigonometric polynomial of degree ``(L,L)``, so the NUFFT evaluates a known
 polynomial from exact Fourier coefficients rather than interpolating scattered data.
 
+![what partial data supports](assets/recoverability.png)
+
+The left panel is the bad news and the right panel is the point: individual coefficients are
+hopeless at small ``f_{\rm sky}``, while band-powers at the geometry's own ``\Delta\ell`` land
+within a few percent over most of the range.
+
 ## What is recoverable
 
 - **The local spectrum, well.** With ``N_w = \Lambda/\lambda`` wavelengths across the patch,

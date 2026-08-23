@@ -11,13 +11,10 @@ using ComputationalBackends: ComputationalBackends
 using Distributed: Distributed
 using LinearAlgebra: LinearAlgebra
 
-function _farm(work, n::Integer)
-    if Distributed.nworkers() == 1
-        return [work(i) for i in 1:n]
-    else
-        return Distributed.pmap(work, 1:n)
-    end
-end
+# `pmap` already runs on the master when there is one worker, so there is nothing to special-case;
+# a hand-written serial branch here would silently turn a DistributedBackend request into a serial
+# run with no signal that no worker was ever used.
+_farm(work, n::Integer) = Distributed.pmap(work, 1:n)
 
 function PartialFSHT._mul_plan_dist!(fs, plans, alms, ::ComputationalBackends.AbstractDistributedBackend)
     throw(ArgumentError(

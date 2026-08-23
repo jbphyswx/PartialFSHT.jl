@@ -100,9 +100,30 @@ Test.@testset "scaled associated Legendre" begin
     Test.@testset "ring work is counted, and polar optimisation reduces it" begin
         L = 512
         θr = collect(range(1e-3, 0.5; length = 120))
-        w_opt = PartialFSHT.counted_ring_work(θr, L, 1e-8)
+        w_opt, _ = PartialFSHT.counted_ring_work(θr, L, 1e-8)
         w_all = length(θr) * sum(L - m + 1 for m in 0:L)
         Test.@test w_opt < w_all
         Test.@test w_opt > 0
+    end
+
+    Test.@testset "retained ranges are the nested intervals, straddling the equator too" begin
+        # `_nested_ranges` walks outward from the peak of `mlim` in O(nθ + lmax) instead of
+        # scanning every ring for every order. It must agree with the scan on every shape,
+        # including a ring set that crosses θ = π/2 where `mlim` rises and then falls.
+        for (lo, hi, L) in ((1e-3, 0.4, 256), (1.2, 2.0, 256), (0.5, 2.6, 512))
+            θr = collect(range(lo, hi; length = 77))
+            mlim = [PartialFSHT.polar_mmax(t, L, 1e-8) for t in θr]
+            jlo, jhi = PartialFSHT._nested_ranges(mlim, L, false)
+            for m in 0:L
+                keep = findall(>=(m), mlim)
+                if isempty(keep)
+                    Test.@test jhi[m + 1] < jlo[m + 1]
+                else
+                    Test.@test (jlo[m + 1], jhi[m + 1]) == (first(keep), last(keep))
+                    # contiguity is the property the engine relies on
+                    Test.@test keep == collect(first(keep):last(keep))
+                end
+            end
+        end
     end
 end

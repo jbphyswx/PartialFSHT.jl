@@ -49,6 +49,8 @@ Past the turning point the Bessel/Airy form gives ``|P| \sim \exp(-m(2\delta)^{3
 m - \nu\sin\theta \;\gtrsim\; \tfrac12 3^{2/3} (\nu\sin\theta)^{1/3} \ln(1/\varepsilon)^{2/3}.
 ```
 
+![polar optimisation](assets/polar.png)
+
 The transition width grows as ``\ell^{1/3}\ln(1/\varepsilon)^{2/3}`` — it is not a constant. At
 ``\ell = 4096``, ``\theta = 0.394``, ``\varepsilon = 10^{-8}`` it is 85 orders, so a fixed pad
 silently over-truncates at high degree. Because ``\{\theta : \sin\theta \ge c\}`` is an interval,
@@ -74,6 +76,8 @@ Substituting collapses to
 ```math
 \varepsilon_{\rm apo} = \sqrt{\frac{2\beta}{L h}}, \qquad K = \frac{L h (1+\varepsilon_{\rm apo})^2}{\pi},
 ```
+
+![the window](assets/window.png)
 
 exactly when the window's spectral spread is what the extra bandwidth allowance pays for. This
 reproduces Carron & Reinecke's ``\varepsilon^{\rm apo}`` and ``L_{\max}``, and shows what they
@@ -167,8 +171,18 @@ the register that produced it: 1.88 → 1.54 ns per triple, and 1.57× on the th
 
 The remaining distance to peak is arithmetic intensity, not scheduling. Each triple is five FMAs
 against roughly fifteen doubles of L1 traffic, and the only structural way to raise that ratio is
-batching — one `P̄` value then feeds `2·ntrans` accumulations against unchanged state traffic,
-which is why `ntrans = 4` costs 1.43 ns per triple against 1.54 at `ntrans = 1`.
+batching — one `P̄` value then feeds `2·ntrans` accumulations against unchanged state traffic.
+
+That works while the accumulators still fit in L1, and stops when they do not. Cost per retained
+triple at `ntrans = 4` against `ntrans = 1`, measured: 1.09× better at ``\ell_{\max} = 512``, 1.12×
+at 1024, and **0.93× — a loss —** at 2048, where ``n_r \times`` `ntrans` complex accumulators
+exceed L1.
+
+Batching must also not be implemented by fusing. Fusing puts the batch loop innermost, where
+`accp[k, b]` strides by ``n_r`` in ``b``; that measured **0.64× at `ntrans = 2`**, because the
+strided inner loop cannot vectorise and the outer loop then cannot either. The batched path
+therefore keeps the two-pass form, with every accumulation contiguous in the ring index — the axis
+worth vectorising. Only the single-transform path fuses.
 
 ## Spin
 
@@ -189,6 +203,17 @@ d^\ell_{m,\ell}(\beta) = \sqrt{\binom{2\ell}{\ell-m}} \cos^{\ell+m}\tfrac\beta2 
 with ``d^\ell_{m,-\ell}`` picking up ``(-1)^{\ell-m}``, and block-scaled exactly as the ALF
 recurrence so ``\sin^{\ell+m}(\beta/2)`` never underflows. ``\ell_0 = 0`` needs its own two seeds
 because the degree recurrence divides by ``\ell``.
+
+## Delivered accuracy
+
+Everything above is a claim about an error budget, so here is the budget spent, against direct
+associated-Legendre evaluation on the same points:
+
+![accuracy](assets/accuracy.png)
+
+And the work the polar optimisation actually removes, counted rather than timed:
+
+![counted work](assets/work.png)
 
 ## References
 

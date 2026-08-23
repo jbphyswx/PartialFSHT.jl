@@ -1,7 +1,5 @@
-"""
-2-D NUFFT seam. Direct summation is always available. FINUFFT / NonuniformFFTs
-are loaded through package extensions.
-"""
+# 2-D NUFFT seam. Direct summation is always available and is the reference the fast backends are
+# tested against; FINUFFT and NonuniformFFTs arrive through package extensions.
 
 abstract type AbstractNUFFTHandle end
 
@@ -144,9 +142,5 @@ function _resolve_nufft(::AutoNUFFT)
 end
 
 @inline _ext_loaded(name::Symbol) = Base.get_extension(@__MODULE__, name) !== nothing
-
-function _nufft_available(::DirectSumBackend)
-    return true
-end
 
 _nufft_finalize!(p) = p

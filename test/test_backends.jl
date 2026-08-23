@@ -133,6 +133,57 @@ Test.@testset "device-generic ring pass on JLArray" begin
     end
 end
 
+Test.@testset "device-generic spin ring pass on JLArray" begin
+    # Same contract as the scalar kernel: the forward direction is race-free and must match the
+    # host exactly, the adjoint scatters atomically and matches to round-off. The seed comes from
+    # the engine's tables, so this also gates those being transferred to the device.
+    Random.seed!(90)
+    for (L, s) in ((32, 2), (128, 1), (128, -2))
+        θh = sort(0.05 .+ 0.5 .* rand(37))
+        almh = zeros(ComplexF64, PartialFSHT.coeff_size(L)..., 1)
+        for ℓ in 0:L, m in -ℓ:ℓ
+            almh[PartialFSHT.spin_coeff_index(ℓ, m, L), 1] = randn(ComplexF64)
+        end
+
+        engh = PartialFSHT.SpinRings(θh, L, s, 1e-8; ntrans = 1)
+        Gh = zeros(ComplexF64, length(θh), 2L + 1, 1)
+        PartialFSHT.spin_rings_from_alm!(Gh, almh, engh)
+
+        engd = PartialFSHT.SpinRings(JLArrays.JLArray(θh), L, s, 1e-8; ntrans = 1)
+        Gd = JLArrays.JLArray(zeros(ComplexF64, length(θh), 2L + 1, 1))
+        PartialFSHT.spin_rings_from_alm!(Gd, JLArrays.JLArray(almh), engd)
+        Test.@test Array(Gd) == Gh
+
+        ah = zeros(ComplexF64, PartialFSHT.coeff_size(L)..., 1)
+        PartialFSHT.spin_alm_from_rings!(ah, Gh, engh)
+        ad = JLArrays.JLArray(zeros(ComplexF64, PartialFSHT.coeff_size(L)..., 1))
+        PartialFSHT.spin_alm_from_rings!(ad, JLArrays.JLArray(Gh), engd)
+        Test.@test maximum(abs.(Array(ad) .- ah)) <= 1e-12 * maximum(abs.(ah))
+
+        Gr = randn(ComplexF64, length(θh), 2L + 1, 1)
+        ar = JLArrays.JLArray(zeros(ComplexF64, PartialFSHT.coeff_size(L)..., 1))
+        PartialFSHT.spin_alm_from_rings!(ar, JLArrays.JLArray(Gr), engd)
+        lhs = LinearAlgebra.dot(Gh, Gr)
+        rhs = LinearAlgebra.dot(almh, Array(ar))
+        Test.@test abs(lhs - rhs) <= 1e-11 * abs(lhs)
+    end
+end
+
+Test.@testset "a host engine with device buffers is refused, not run" begin
+    # An engine built from a host ring vector has host-resident tables. Handing it a device grid
+    # is a launch failure on real hardware and would silently work on a CPU-backed KA backend, so
+    # it is checked rather than left to the launch.
+    L = 32
+    θh = sort(0.05 .+ 0.4 .* rand(21))
+    engh = PartialFSHT.RingLegendre(θh, L, 1e-8; ntrans = 1)
+    almd = JLArrays.JLArray(zeros(ComplexF64, PartialFSHT.coeff_size(L)..., 1))
+    Gd = JLArrays.JLArray(zeros(ComplexF64, length(θh), 2L + 1, 1))
+    Test.@test_throws ArgumentError PartialFSHT.rings_from_alm!(Gd, almd, engh)
+
+    sengh = PartialFSHT.SpinRings(θh, L, 2, 1e-8; ntrans = 1)
+    Test.@test_throws ArgumentError PartialFSHT.spin_rings_from_alm!(Gd, almd, sengh)
+end
+
 Test.@testset "DFS doubling is the transpose of folding" begin
     Random.seed!(86)
     Nθ, Nφ, B = 6, 10, 1

@@ -1,28 +1,15 @@
-"""
-Scaled associated-Legendre evaluation on iso-latitude rings.
-
-Fully normalised ALFs `P̄_ℓ^m(cosθ)` with the Condon–Shortley sectorial sign satisfy
-
-    Y_ℓm(θ,φ) = P̄_ℓ^m(cosθ) e^{imφ},      P̄_ℓ^{-m} = (-1)^m P̄_ℓ^m
-
-and follow the fixed-order, increasing-degree recurrence
-
-    P̄_m^m     = -√((2m+1)/(2m)) sinθ P̄_{m-1}^{m-1},      P̄_0^0 = 1/√(4π)
-    P̄_{m+1}^m = √(2m+3) cosθ P̄_m^m
-    P̄_ℓ^m     = a_ℓ^m cosθ P̄_{ℓ-1}^m - b_ℓ^m P̄_{ℓ-2}^m.
-
-The sectorial seed carries `sin^m θ`, which flushes to zero in IEEE-754 long before it stops
-mattering: on a 20° cap at `lmax = 4096` it vanishes at `m = 801` while orders out to
-`m = 1636` still hold 67% of the outermost ring's Legendre energy. The recurrence therefore
-runs in *block-scaled* form — one shared power-of-two exponent per ring chunk, renormalised on
-a fixed stride — so the usable range is the exponent's rather than the mantissa's. Partial sums
-are carried in the same scale, so the only terms dropped are ones already negligible against
-the running maximum.
-
-Polar optimisation (Reinecke & Seljebotn, A&A 554 A112, 2013) confines each order to the
-contiguous ring range where it is not negligible, as a reduction in work rather than a mask on
-the accumulation; see [`polar_mmax`](@ref).
-"""
+# Scaled associated-Legendre evaluation on iso-latitude rings — the one ALF implementation in the
+# package, used by the oracle as well with polar optimisation switched off.
+#
+#     Y_ℓm(θ,φ) = P̄_ℓ^m(cosθ) e^{imφ},      P̄_ℓ^{-m} = (-1)^m P̄_ℓ^m
+#     P̄_m^m     = -√((2m+1)/(2m)) sinθ P̄_{m-1}^{m-1},      P̄_0^0 = 1/√(4π)
+#     P̄_{m+1}^m = √(2m+3) cosθ P̄_m^m
+#     P̄_ℓ^m     = a_ℓ^m cosθ P̄_{ℓ-1}^m - b_ℓ^m P̄_{ℓ-2}^m
+#
+# The recurrence runs block-scaled (mantissa × 2^E, one exponent per ring chunk) because the
+# sectorial seed's sin^m θ underflows long before it stops mattering. Derivations are in the manual
+# under Theory; the engineering constraints — chunk headroom, the nested retained ranges, the fused
+# inner loop and the kernel shape that lost — are under Implementation notes.
 
 # The recurrence grows by at most ~2x per degree while evanescent, so 64 degrees is ~10^19 of
 # growth — well inside the mantissa range, and cheap to amortise.
@@ -70,10 +57,99 @@ function polar_mmax(θ::Real, lmax::Integer, ε::Real; pad_factor::Real = polar_
 end
 
 """
-Recurrence state and partial sums for one ring chunk. One per task slot: the `m` loop is
-embarrassingly parallel — distinct orders touch distinct `G` columns going forward and distinct
-coefficient entries coming back — so the only thing standing between it and a thread is that the
-scratch used to be shared.
+    sectorial_log2c(T, lmax) -> Vector{T}
+
+`log₂` of the sectorial prefactor `c_m = (1/√(4π)) Π_{k=1}^m √((2k+1)/(2k))`, accumulated in log
+space so it can neither under- nor overflow. The `(-1)^m` Condon–Shortley sign is applied at use.
+"""
+function sectorial_log2c(::Type{T}, lmax::Integer) where {T}
+    L = Int(lmax)
+    v = Vector{T}(undef, L + 1)
+    acc = -log2(sqrt(4 * T(π)))
+    v[1] = acc
+    @inbounds for m in 1:L
+        acc += log2(sqrt(T(2m + 1) / T(2m)))
+        v[m + 1] = acc
+    end
+    return v
+end
+
+"""
+    _nested_ranges(mlim, lmax, symmetric) -> (jlo, jhi)
+
+Contiguous retained ring range per order: `{j : mlim[j] ≥ |m|}`, indexed by `m ∈ 0:lmax` when
+`symmetric` is `false` and by `m ∈ -lmax:lmax` when it is `true`.
+
+`mlim` is unimodal in `j` — it tracks `sinθ`, which rises then falls over ascending colatitude —
+so the retained sets are *nested* as the order grows, and all of them come out of one outward walk
+from the peak in `O(nθ + lmax)`. Scanning every ring for every order instead is `O(lmax · nθ)`,
+which at `lmax = 2048` is half a million comparisons inside a cost model that gets consulted
+several times per plan.
+"""
+function _nested_ranges(mlim::Vector{Int}, lmax::Integer, symmetric::Bool)
+    L = Int(lmax)
+    n = length(mlim)
+    n >= 1 || throw(ArgumentError("need at least one ring"))
+    # Unimodality is what makes one outward walk sufficient; check it rather than assume it.
+    peak = argmax(mlim)
+    @inbounds for j in 2:peak
+        mlim[j] >= mlim[j - 1] ||
+            throw(ArgumentError("retained-order limits are not unimodal in colatitude " *
+                                "(fell at ring $j, before the peak at $peak)"))
+    end
+    @inbounds for j in (peak + 1):n
+        mlim[j] <= mlim[j - 1] ||
+            throw(ArgumentError("retained-order limits are not unimodal in colatitude " *
+                                "(rose at ring $j, after the peak at $peak)"))
+    end
+
+    nm = symmetric ? 2L + 1 : L + 1
+    jlo = fill(1, nm)
+    jhi = fill(0, nm)
+    idx = (m) -> symmetric ? m + L + 1 : m + 1
+    lo = hi = peak
+    mtop = min(mlim[peak], L)
+    @inbounds for m in mtop:-1:0
+        while lo > 1 && mlim[lo - 1] >= m
+            lo -= 1
+        end
+        while hi < n && mlim[hi + 1] >= m
+            hi += 1
+        end
+        jlo[idx(m)] = lo
+        jhi[idx(m)] = hi
+        if symmetric && m > 0
+            jlo[idx(-m)] = lo
+            jhi[idx(-m)] = hi
+        end
+    end
+    return jlo, jhi
+end
+
+"""
+    retained_triples(mlim, lmax) -> Int
+
+Retained `(ℓ, m, ring)` triples implied by per-ring order limits, in `O(nθ + lmax)` and without
+allocating. Both the engines and the cost model count the same way, so a planner decision and the
+work it predicts cannot drift apart.
+"""
+function retained_triples(mlim::Vector{Int}, lmax::Integer)
+    L = Int(lmax)
+    jlo, jhi = _nested_ranges(mlim, L, false)
+    w = 0
+    @inbounds for m in 0:L
+        nj = jhi[m + 1] - jlo[m + 1] + 1
+        nj > 0 && (w += nj * (L - m + 1))
+    end
+    return w
+end
+
+"""
+Recurrence state and partial sums for one ring chunk, one per task slot.
+
+The order loop is embarrassingly parallel — distinct orders touch distinct `G` columns going
+forward and distinct coefficient entries coming back — so a per-slot scratch is the only thing
+threading it requires.
 """
 struct RingScratch{T<:AbstractFloat, CT<:Complex, VT<:AbstractVector{T}, MT<:AbstractMatrix{CT}}
     p1::VT
@@ -96,13 +172,12 @@ The retained ring set for an order is contiguous because `{θ : sinθ ≥ c}` is
 which holds whether the rings lie north of the equator, south of it, or straddle it.
 """
 struct RingLegendre{T<:AbstractFloat, CT<:Complex, VT<:AbstractVector{T},
-                    MT<:AbstractMatrix{CT}, VI<:AbstractVector{Int}}
+                    VI<:AbstractVector{Int}, SC}
     lmax::Int
     ntrans::Int
     ε::T
     θ::VT
     cosθ::VT
-    sinθ::VT
     log2sinθ::VT
     log2c::VT
     mlim::VI              # follows the node array type, so a device kernel can read it
@@ -110,7 +185,7 @@ struct RingLegendre{T<:AbstractFloat, CT<:Complex, VT<:AbstractVector{T},
     jlo::Vector{Int}      # host-side loop bounds
     jhi::Vector{Int}
     chunks::Vector{UnitRange{Int}}
-    slots::Vector{RingScratch{T, CT, VT, MT}}
+    slots::Vector{SC}
 end
 
 """Number of independent task slots the ring pass can use."""
@@ -118,7 +193,8 @@ nslots(eng::RingLegendre) = length(eng.slots)
 
 function RingLegendre(θ::AbstractVector, lmax::Integer, ε::Real;
                       ntrans::Integer = 1, CT::Type = Complex{float(eltype(θ))},
-                      slots::Integer = max(1, Threads.nthreads()))
+                      slots::Integer = max(1, Threads.nthreads()),
+                      reflect::Bool = false)
     T = float(eltype(θ))
     L = Int(lmax)
     L >= 0 || throw(ArgumentError("lmax must be nonnegative"))
@@ -126,51 +202,40 @@ function RingLegendre(θ::AbstractVector, lmax::Integer, ε::Real;
     B >= 1 || throw(ArgumentError("ntrans must be ≥ 1"))
     nθ = length(θ)
     nθ >= 1 || throw(ArgumentError("need at least one ring"))
-    issorted(θ) || throw(ArgumentError("ring colatitudes must be sorted ascending"))
 
     # Everything derived from the ring set is built on the host and transferred once. The
     # geometry is a plan-time O(nθ + L) computation, so doing it with scalar indexing is free —
-    # and doing it *on* a device array would be scalar iteration on the GPU.
+    # and doing it *on* a device array would be scalar iteration on the GPU. That includes the
+    # sortedness check, which is why it comes after the host copy.
     θh = T.(_host(θ))
+    issorted(θh) || throw(ArgumentError("ring colatitudes must be sorted ascending"))
     cosθ_h = similar(θh)
     sinθ_h = similar(θh)
     log2sinθ_h = similar(θh)
+    # `reflect` means the physical colatitudes are `π .- θ`, with `θ` the ascending array given.
+    # Since `sin(π-θ) = sin θ`, the seed, the polar-optimisation limits and the chunking are all
+    # unchanged and the entire reflection is one sign on `cosθ`: the recurrence
+    # `P̄_ℓ^m = a cosθ P̄_{ℓ-1}^m - b P̄_{ℓ-2}^m` with `cosθ → -cosθ` reproduces `(-1)^{ℓ+m} P̄_ℓ^m`
+    # by induction from a seed that does not involve `cosθ` at all. That is exactly the reflection
+    # identity `Y_ℓm(π-θ,φ) = (-1)^{ℓ+m} Y_ℓm(θ,φ)`, so it needs no pass over the coefficients.
+    csgn = reflect ? -one(T) : one(T)
     @inbounds for j in 1:nθ
         s, c = sincos(θh[j])
         as = abs(s)
         sinθ_h[j] = as
-        cosθ_h[j] = c
+        cosθ_h[j] = csgn * c
         log2sinθ_h[j] = as > 0 ? log2(as) : T(-Inf)
     end
     cosθ = _to_like(θ, cosθ_h)
-    sinθ = _to_like(θ, sinθ_h)
     log2sinθ = _to_like(θ, log2sinθ_h)
 
-    mlim = [polar_mmax(θh[j], L, ε) for j in 1:nθ]
-
-    jlo = fill(1, L + 1)
-    jhi = fill(0, L + 1)
-    @inbounds for m in 0:L
-        lo, hi = 0, -1
-        for j in 1:nθ
-            if mlim[j] >= m
-                lo == 0 && (lo = j)
-                hi = j
-            end
-        end
-        jlo[m + 1] = lo == 0 ? 1 : lo
-        jhi[m + 1] = hi
+    mlim = Vector{Int}(undef, nθ)
+    @inbounds for j in 1:nθ
+        mlim[j] = polar_mmax(θh[j], L, ε)
     end
+    jlo, jhi = _nested_ranges(mlim, L, false)
 
-    # log2 of the sectorial prefactor c_m = (1/√(4π)) Π_{k=1}^m √((2k+1)/(2k)), accumulated in
-    # log space so it cannot under/overflow. The (-1)^m sign is applied at use.
-    log2c_h = Vector{T}(undef, L + 1)
-    acc = -log2(sqrt(4 * T(π)))
-    log2c_h[1] = acc
-    @inbounds for m in 1:L
-        acc += log2(sqrt(T(2m + 1) / T(2m)))
-        log2c_h[m + 1] = acc
-    end
+    log2c_h = sectorial_log2c(T, L)
     log2c = _to_like(θ, log2c_h)
 
     chunks = _ring_chunks(sinθ_h, mlim)
@@ -184,8 +249,8 @@ function RingLegendre(θ::AbstractVector, lmax::Integer, ε::Real;
           for _ in 1:ns]
     mlim_dev = _to_like(θ, mlim)
 
-    return RingLegendre{T, CT, VT, MT, typeof(mlim_dev)}(
-        L, B, T(ε), θ, cosθ, sinθ, log2sinθ, log2c, mlim_dev, maximum(mlim),
+    return RingLegendre{T, CT, VT, typeof(mlim_dev), eltype(sl)}(
+        L, B, T(ε), _to_like(θ, θh), cosθ, log2sinθ, log2c, mlim_dev, maximum(mlim),
         jlo, jhi, chunks, sl)
 end
 
@@ -341,16 +406,21 @@ function _ring_chunk!(dir, G, alm, eng::RingLegendre{T, CT}, m::Int,
             a = sqrt(T(2ℓ - 1) * T(2ℓ + 1) / (T(ℓ - m) * T(ℓ + m)))
             b = sqrt(T(2ℓ + 1) / T(2ℓ - 3) * T(ℓ - m - 1) / T(ℓ - m) *
                      T(ℓ + m - 1) / T(ℓ + m))
+            # Single transform: fuse the recurrence with its accumulation so the new `P̄` value is
+            # consumed in the register that produced it. Measured ~10% over the two-pass form; the
+            # state stays L1-resident either way, so this is the whole win available from
+            # restructuring — a register-resident kernel with the degree loop innermost measured
+            # *2× worse*, because it caps SIMD at the unroll width while this loop vectorises
+            # across the entire ring chunk.
+            #
+            # Batched transforms deliberately do NOT fuse. Fusing would put the batch loop
+            # innermost, and `accp[k, bb]` strides by `nr` in `bb` — measured 0.64x at
+            # `ntrans = 2` against the two-pass form, because the strided inner loop cannot
+            # vectorise and the outer one no longer can either. The two-pass form below keeps every
+            # accumulation contiguous in the ring index, which is the axis worth vectorising.
             if dir isa _Fwd && B == 1
-                # Single-transform forward: fuse the recurrence with its accumulation so the new
-                # `P̄` value is consumed in the register that produced it. Measured ~10% over the
-                # two-pass form; the state stays L1-resident either way, so this is the whole win
-                # available from restructuring — a register-resident kernel with the degree loop
-                # innermost measured *2× worse*, because it caps SIMD at the unroll width while
-                # the loop below vectorises across the entire ring chunk.
                 ap = _coeff(alm, ℓ, m, 1)
-                am = m == 0 ? zero(ap) : _coeff(alm, ℓ, -m, 1)
-                ams = am * sgn
+                ams = (m == 0 ? zero(ap) : _coeff(alm, ℓ, -m, 1)) * sgn
                 @inbounds @simd for k in 1:nr
                     p = a * cs[k] * p1[k] - b * p2[k]
                     p2[k] = p1[k]
@@ -359,8 +429,8 @@ function _ring_chunk!(dir, G, alm, eng::RingLegendre{T, CT}, m::Int,
                     accm[k, 1] += ams * p
                 end
             elseif dir isa _Adj && B == 1
-                # Single-transform adjoint: the same fusion, with a reduction in place of an
-                # accumulation. `accp`/`accm` hold the ring data and are read-only here.
+                # `accp`/`accm` hold the ring data and are read-only here; the running scale
+                # multiplies the output, which is what makes this the exact transpose.
                 f = exp2(E)
                 sp = zero(eltype(alm))
                 sm = zero(eltype(alm))
@@ -525,7 +595,10 @@ function alf(::Type{T}, ℓ::Integer, m::Integer, θ::Real) where {T<:AbstractFl
     return flip * _ldexp2(p1, E)
 end
 
-alf(ℓ::Integer, m::Integer, θ::Real) = alf(Float64, ℓ, m, θ)
+# Element type follows the argument, so a `BigFloat` colatitude is evaluated in `BigFloat` rather
+# than silently rounded to Float64 — which matters, since this is the reference the fast paths and
+# the `BigFloat` comparisons are gated against.
+alf(ℓ::Integer, m::Integer, θ::Real) = alf(float(typeof(float(θ))), ℓ, m, θ)
 
 # `E` is an integral-valued float; keep the scaling exact and avoid Int overflow at BigFloat.
 @inline _ldexp2(v::T, E) where {T} = v * exp2(T(E))

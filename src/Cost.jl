@@ -1,13 +1,10 @@
-"""
-Planner cost model.
-
-Costs are *counted* operations — retained `(ℓ,m,ring)` triples, FFT butterflies, NUFFT
-spreading writes — scaled by per-unit constants measured once by `benchmark/calibrate.jl`. The
-previous model estimated the ring pass as `L²·θ⋆`, which is a factor `L` short of the truth,
-and then needed a cascade of tuned overrides (`fsky ≥ 0.3 → Inf`, `clusters ≤ 3 && cover < 0.5`,
-`thin_ok`, `steal`) to reach the right answer anyway. Counting instead of guessing removes the
-overrides, and makes a complexity claim testable without a stopwatch.
-"""
+# Planner cost model.
+#
+# Costs are *counted* operations — retained (ℓ,m,ring) triples, FFT butterflies, NUFFT spreading
+# writes — scaled by per-unit constants measured once by `benchmark/calibrate.jl`. Counting rather
+# than estimating means there are no tuned thresholds, and it makes a complexity claim testable by
+# assertion instead of by stopwatch: `counted_ring_work` and `ring_work(engine)` count the same way,
+# and a test asserts they agree exactly.
 
 """
     AbstractAlgorithm
@@ -81,21 +78,24 @@ cost_calibrated() = _COST.calibrated
 _fftunits(n::Integer) = n <= 1 ? 0.0 : Float64(n) * log2(Float64(n))
 
 """
-    counted_ring_work(θ_rings, lmax, tol) -> Int
+    counted_ring_work(θ_rings, lmax, tol) -> (triples, mmax)
 
-Retained `(ℓ, m, ring)` triples for a ring set, without building the engine: the polar-optimised
-work count the ALF pass will actually do.
+Retained `(ℓ, m, ring)` triples for a ring set, and the largest order any ring keeps, without
+building the engine. One pass of [`polar_mmax`](@ref) feeds both, and the retained ranges come from
+the nested-interval walk in [`retained_triples`](@ref) rather than from a `count` per order — the
+latter is `O(lmax · nθ)` inside a function the planner calls several times per plan.
 """
 function counted_ring_work(θ_rings::AbstractVector, lmax::Integer, tol::Real)
     L = Int(lmax)
-    mlim = [polar_mmax(t, L, tol) for t in θ_rings]
-    w = 0
-    @inbounds for m in 0:L
-        nj = count(>=(m), mlim)
-        nj == 0 && continue
-        w += nj * (L - m + 1)
+    n = length(θ_rings)
+    mlim = Vector{Int}(undef, n)
+    mx = 0
+    @inbounds for j in 1:n
+        v = polar_mmax(θ_rings[j], L, tol)
+        mlim[j] = v
+        mx = max(mx, v)
     end
-    return w
+    return retained_triples(mlim, L), mx
 end
 
 """
@@ -115,12 +115,11 @@ function cost_stretch(box::SphereBox, npts::Integer, lmax::Integer, ntrans::Inte
                       tol::Real)
     L = Int(lmax)
     B = Int(ntrans)
-    geom = try
-        stretch_geometry(box.θlo, box.θhi, L, tol)
-    catch err
-        err isa ArgumentError && return Inf
-        rethrow()
-    end
+    # A degenerate geometry is a modelling answer ("use a direct evaluation"), not an exception, so
+    # ask for it as a query. Catching `ArgumentError` here would also swallow a genuine bad
+    # argument and silently report the stretch leaf as infinitely expensive.
+    geom = try_stretch_geometry(box.θlo, box.θhi, L, tol)
+    geom === nothing && return Inf
     # Mirror StretchLeaf's own sizing exactly; costing a grid the leaf would not build makes
     # the model wrong in the one place it is consulted.
     Kθ = geom.K + _K_MARGIN
@@ -132,8 +131,8 @@ function cost_stretch(box::SphereBox, npts::Integer, lmax::Integer, ntrans::Inte
         nθ = 2 * nθ_half
     end
     θr, _ = stretch_rings(geom, nθ_half)
-    rings = counted_ring_work(sort(θr), L, tol)
-    mmax = maximum(polar_mmax(t, L, tol) for t in θr)
+    issorted(θr) || reverse!(θr)
+    rings, mmax = counted_ring_work(θr, L, tol)
     nφ = next_smooth_even(2 * mmax + 1)
     fft = _fftunits(nφ) * length(θr) + _fftunits(nθ * nφ)
     spread = Float64(npts) * (2 * ceil(abs(log10(max(float(tol), 1e-16)))) + 2)^2
@@ -168,10 +167,9 @@ Pick the cheapest available leaf by counted cost. No thresholds: a compact patch
 stretch leaf because its ring count is small, a band wins because its colatitude interval is
 thin, a near-full sky loses to NUFSHT because the counted work converges to NUFSHT's own.
 
-Partitioning is only attempted when a single box leaves a large fraction of the sphere unused,
-so an ordinary patch never pays for a partition search it cannot benefit from — the previous
-planner ran spherical k-means, up to 32 restarts of 25 iterations, on *every* construction just
-to decide.
+Partitioning is always attempted, because [`partition_boxes`](@ref) keeps a cut only when counted
+cost falls and the search costs `O(maxboxes · n)` without sorting — a compact patch and a band both
+come back as a single box.
 """
 function select_method(θ, φ, lmax::Integer, tol::Real, requested::AbstractAlgorithm,
                        ntrans::Integer, spin::Integer = 0)
@@ -188,14 +186,13 @@ function select_method(θ, φ, lmax::Integer, tol::Real, requested::AbstractAlgo
     cs < bestc && ((best, bestc) = (StretchAlgorithm(), cs))
 
     # `partition_boxes` keeps a cut only when counted cost falls, so it is safe to always try:
-    # a compact patch and a band both come back as a single box, and the search is O(n log n)
-    # per candidate rather than the k-means restarts the previous planner ran.
+    # a compact patch and a band both come back as a single box. The search sorts once and then
+    # costs `O(maxboxes · n)`, and it already returns each group's box and cost, so nothing here
+    # re-derives a bounding box per group.
     costfn = (b, np) -> cost_stretch(b, np, L, ntrans, tol)
-    groups = partition_boxes(θ, φ, costfn)
+    groups, _, gcosts = partition_boxes_costed(θ, φ, costfn)
     if length(groups) > 1
-        θh, φh = _host(θ), _host(φ)
-        cm = sum(cost_stretch(bounding_box(view(θh, g), view(φh, g)), length(g),
-                              L, ntrans, tol) for g in groups)
+        cm = sum(gcosts)
         cm < bestc && ((best, bestc) = (MultiBoxAlgorithm(), cm))
     end
 
