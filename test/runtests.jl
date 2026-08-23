@@ -12,6 +12,7 @@ using GPUArraysCore: GPUArraysCore
 using JLArrays: JLArrays
 using NUFSHT: NUFSHT
 using OhMyThreads: OhMyThreads
+using Distributed: Distributed
 
 """
 Random coefficients in the *valid* modes only. `coeff_size(lmax)` is `(lmax+1)×(2lmax+1)` but
@@ -54,6 +55,7 @@ Test.@testset "PartialFSHT.jl" begin
     include("test_analysis.jl")
     include("test_cost.jl")
     include("test_backends.jl")
+    include("test_distributed.jl")
     include("test_allocs.jl")
 
     Test.@testset "Aqua quality checks" begin

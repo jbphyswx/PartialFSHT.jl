@@ -157,8 +157,8 @@ _synthesize!(f, alm, leaf::DirectLeaf, ::Plan) = synthesize_direct!(f, alm, leaf
 _adjoint_apply!(alm, f, leaf::DirectLeaf, ::Plan) = adjoint_direct!(alm, f, leaf)
 _synthesize!(f, alm, leaf::SpinDirectLeaf, ::Plan) = synthesize_spin_direct!(f, alm, leaf)
 _adjoint_apply!(alm, f, leaf::SpinDirectLeaf, ::Plan) = adjoint_spin_direct!(alm, f, leaf)
-_synthesize!(f, alm, leaf::StretchLeaf, ::Plan) = synthesize_stretch!(f, alm, leaf)
-_adjoint_apply!(alm, f, leaf::StretchLeaf, ::Plan) = adjoint_stretch!(alm, f, leaf)
+_synthesize!(f, alm, leaf::StretchLeaf, p::Plan) = synthesize_stretch!(f, alm, leaf, p.backend)
+_adjoint_apply!(alm, f, leaf::StretchLeaf, p::Plan) = adjoint_stretch!(alm, f, leaf, p.backend)
 _synthesize!(f, alm, leaf::MultiBoxLeaf, ::Plan) = synthesize_multibox!(f, alm, leaf)
 _adjoint_apply!(alm, f, leaf::MultiBoxLeaf, ::Plan) = adjoint_multibox!(alm, f, leaf)
 

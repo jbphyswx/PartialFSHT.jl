@@ -117,6 +117,59 @@ A southern periodisation is reflected to the north via
 the coefficients — because increasing ``\Theta`` there maps to *decreasing* ``\theta`` and the
 grid and the ring engine would otherwise disagree on order.
 
+## The front end that was measured and rejected
+
+There is an alternative to the associated-Legendre ring pass. Take ``a_{\ell m}`` to bivariate
+Fourier coefficients with FastTransforms' `sph2fourier` — ``O(L^2\log^2 L)``, asymptotically
+better than the ring pass's ``O(L^2 n_\theta)`` — and then reduce to the patch with a banded
+operator. Writing ``u(\theta) = \sum_{|k|\le L} F_{k,m}e^{ik\theta}``, the periodised product
+``v(\Theta) = u(c+\Theta/s)\,w(\Theta)`` has
+
+```math
+V_\kappa = \sum_k F_{k,m} e^{ikc}\, \hat W(\kappa - k/s),
+\qquad \hat W(\xi) = \frac1{2\pi}\int_{-\pi}^{\pi} w(\Theta)e^{-i\xi\Theta}\,d\Theta,
+```
+
+and ``\hat W`` decays at the window's roll-off rate, so truncating to ``|\kappa - k/s| \le b/2``
+with ``b = O(\log(1/\varepsilon) + \log L)`` makes the stretch a precomputed *banded* matrix whose
+transpose is the exact adjoint — cost ``O(L^2 b)``, independent of patch position.
+
+This was left conditional on measurement, and the measurement says do not build it. On one
+machine at 8 threads, `sph2fourier` *alone* against the threaded ring pass it would replace:
+
+| `lmax` | `sph2fourier` | ring pass (threaded) | ratio |
+| ---: | ---: | ---: | ---: |
+| 256 | 2.7 ms | 1.6 ms | 1.7× |
+| 512 | 14.0 ms | 5.1 ms | 2.7× |
+| 1024 | 90 ms | 29 ms | 3.1× |
+| 2048 | 683 ms | 141 ms | 4.9× |
+
+The better asymptotics do not pay at these degrees, and the gap *widens* with ``L``. The ring
+pass stays the front end.
+
+## The kernel shape that was measured and rejected
+
+The ring pass runs the degree recurrence as a SIMD loop *across rings*, holding the two-term
+state in arrays, and fuses the accumulation into the same loop. The obvious alternative — the
+shape libsharp-style kernels use — is to put the ring loop outermost in blocks of a few rings and
+the degree loop innermost, so the state and the partial sums never leave registers. On paper that
+removes two stores per ring per degree.
+
+Measured, it is **2× slower** (2.23–2.53 ns per triple against 1.24 for an idealised version of
+the current shape). The reason is that the current loop vectorises across the whole ring chunk —
+hundreds of contiguous elements — while a hand-unrolled block of four caps instruction-level
+parallelism at four and the compiler cannot widen it. The state is L1-resident either way, so the
+stores the restructure would have removed are cheap next to the FMA throughput the wide loop
+gains.
+
+What *did* pay was fusing the recurrence with its accumulation so the new value is consumed in
+the register that produced it: 1.88 → 1.54 ns per triple, and 1.57× on the threaded stage.
+
+The remaining distance to peak is arithmetic intensity, not scheduling. Each triple is five FMAs
+against roughly fifteen doubles of L1 traffic, and the only structural way to raise that ratio is
+batching — one `P̄` value then feeds `2·ntrans` accumulations against unchanged state traffic,
+which is why `ntrans = 4` costs 1.43 ns per triple against 1.54 at `ntrans = 1`.
+
 ## Spin
 
 ```math

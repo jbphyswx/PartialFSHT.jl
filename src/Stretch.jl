@@ -20,6 +20,34 @@ as well is a further saving for mid-latitude patches; it needs a zoom/chirp-z pe
 gated on the calibration measurement rather than assumed.
 """
 
+# FFTW's thread count is process-global and is baked into a plan at planning time.
+const _FFTW_PLAN_LOCK = ReentrantLock()
+
+"""
+    _with_fftw_threads(f, n)
+
+Run `f()` with FFTW's planner thread count pinned to `n`, restoring it afterwards. Serialised,
+because that count is process-global.
+
+Plans are built at one thread by default. A multithreaded FFTW plan spawns Julia tasks on *every
+execution* — measured 4032 B for one 2-D transform at `lmax = 256`, versus 0 B for the same plan
+built at one thread — so a threaded FFT would make every apply allocate. The FFT is ~2% of a
+stretched apply while the ring pass is ~56%, and the ring pass is threaded here directly, so
+pinning costs almost nothing and keeps the apply allocation-free through a solver's worth of
+iterations.
+"""
+function _with_fftw_threads(f, n::Integer)
+    return Base.lock(_FFTW_PLAN_LOCK) do
+        prev = FFTW.get_num_threads()
+        try
+            FFTW.set_num_threads(max(1, Int(n)))
+            return f()
+        finally
+            FFTW.set_num_threads(prev)
+        end
+    end
+end
+
 """
     next_smooth_even(n) -> Int
 
@@ -111,7 +139,8 @@ end
 function StretchLeaf(θ::AbstractVector, φ::AbstractVector, lmax::Integer, ntrans::Integer,
                      tol::Real; nufft_backend = DirectSumBackend(), spin::Integer = 0,
                      box = nothing, εapo_max::Real = _EPS_APO_MAX,
-                     oversample_θ::Real = 1, oversample_φ::Real = 1)
+                     oversample_θ::Real = 1, oversample_φ::Real = 1,
+                     fft_threads::Integer = 1)
     T = float(eltype(θ))
     CT = Complex{T}
     L = Int(lmax)
@@ -189,10 +218,10 @@ function StretchLeaf(θ::AbstractVector, φ::AbstractVector, lmax::Integer, ntra
     Fhat = _zeros_like(θ, CT, nθ, nφ, B)
     fbuf = _zeros_like(θ, CT, n, B)
 
-    ring_bfft = AbstractFFTs.plan_bfft(Fφ, 2)
-    ring_fft = AbstractFFTs.plan_fft(Fφ, 2)
-    fft_plan = AbstractFFTs.plan_fft(F̃, (1, 2))
-    ifft_plan = AbstractFFTs.plan_bfft(Fhat, (1, 2))
+    ring_bfft, ring_fft, fft_plan, ifft_plan = _with_fftw_threads(fft_threads) do
+        (AbstractFFTs.plan_bfft(Fφ, 2), AbstractFFTs.plan_fft(Fφ, 2),
+         AbstractFFTs.plan_fft(F̃, (1, 2)), AbstractFFTs.plan_bfft(Fhat, (1, 2)))
+    end
 
     # Half-cell offset in Θ only where the ring grid is a midpoint grid (pole / full sphere);
     # the interior grid starts at Θ = 0 and needs no shift.
@@ -239,7 +268,8 @@ ring_work(leaf::StretchLeaf) = ring_work(leaf.eng)
 
 # ---------------------------------------------------------------------------------------
 
-function synthesize_stretch!(f, alm, leaf::StretchLeaf)
+function synthesize_stretch!(f, alm, leaf::StretchLeaf,
+                             backend = ComputationalBackends.SerialBackend())
     B = leaf.ntrans
     _assert_coeffs(alm, leaf.lmax, B)
     _assert_field(f, length(leaf.Θ_pts), B)
@@ -250,7 +280,7 @@ function synthesize_stretch!(f, alm, leaf::StretchLeaf)
         src = leaf.almwork
     end
 
-    _fill_rings!(leaf.G, src, leaf.eng)
+    _fill_rings!(leaf.G, src, leaf.eng, backend)
     _rings_to_grid!(leaf.F, leaf.G, leaf.lmax, leaf.ring_bfft, leaf.Fφ)
     leaf.F .*= leaf.wθ
     _periodize!(leaf.F̃, leaf.F, leaf.geomθ, leaf.spin)
@@ -261,7 +291,8 @@ function synthesize_stretch!(f, alm, leaf::StretchLeaf)
     return f
 end
 
-function adjoint_stretch!(alm, f, leaf::StretchLeaf)
+function adjoint_stretch!(alm, f, leaf::StretchLeaf,
+                          backend = ComputationalBackends.SerialBackend())
     B = leaf.ntrans
     _assert_coeffs(alm, leaf.lmax, B)
     _assert_field(f, length(leaf.Θ_pts), B)
@@ -275,7 +306,7 @@ function adjoint_stretch!(alm, f, leaf::StretchLeaf)
     _grid_to_rings!(leaf.G, leaf.F, leaf.lmax, leaf.ring_fft, leaf.Fφ)
 
     dst = leaf.flip_south ? leaf.almwork : alm
-    _drain_rings!(dst, leaf.G, leaf.eng)
+    _drain_rings!(dst, leaf.G, leaf.eng, backend)
     if leaf.flip_south
         _apply_parity!(alm, dst, leaf.parity, B)
     end
@@ -284,10 +315,10 @@ end
 
 # One ring engine per spin weight; the scalar and spin recurrences differ, the surrounding
 # pipeline does not.
-_fill_rings!(G, alm, eng::RingLegendre) = rings_from_alm!(G, alm, eng)
-_fill_rings!(G, alm, eng::SpinRings) = spin_rings_from_alm!(G, alm, eng)
-_drain_rings!(alm, G, eng::RingLegendre) = alm_from_rings!(alm, G, eng)
-_drain_rings!(alm, G, eng::SpinRings) = spin_alm_from_rings!(alm, G, eng)
+_fill_rings!(G, alm, eng::RingLegendre, be) = rings_from_alm!(G, alm, eng, be)
+_fill_rings!(G, alm, eng::SpinRings, be) = spin_rings_from_alm!(G, alm, eng, be)
+_drain_rings!(alm, G, eng::RingLegendre, be) = alm_from_rings!(alm, G, eng, be)
+_drain_rings!(alm, G, eng::SpinRings, be) = spin_alm_from_rings!(alm, G, eng, be)
 
 function _apply_parity!(out, src, parity, B::Int)
     if ndims(out) == 3 && ndims(src) == 3

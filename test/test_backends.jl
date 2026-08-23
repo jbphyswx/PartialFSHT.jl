@@ -96,6 +96,43 @@ Test.@testset "device-generic DFS on JLArray" begin
     end
 end
 
+Test.@testset "device-generic ring pass on JLArray" begin
+    # The forward kernel is race-free — one thread per (ring, order), each owning its output — so
+    # it must agree with the host *exactly*. The adjoint scatters through atomic adds, so its
+    # summation order is not fixed and it can only agree to round-off.
+    Random.seed!(89)
+    for L in (32, 128, 257)
+        θh = sort(0.02 .+ 0.6 .* rand(41))
+        almh = zeros(ComplexF64, PartialFSHT.coeff_size(L)..., 1)
+        for ℓ in 0:L, m in -ℓ:ℓ
+            almh[PartialFSHT.sph_mode(ℓ, m), 1] = randn(ComplexF64)
+        end
+
+        engh = PartialFSHT.RingLegendre(θh, L, 1e-8; ntrans = 1)
+        Gh = zeros(ComplexF64, length(θh), 2L + 1, 1)
+        PartialFSHT.rings_from_alm!(Gh, almh, engh)
+
+        engd = PartialFSHT.RingLegendre(JLArrays.JLArray(θh), L, 1e-8; ntrans = 1)
+        Gd = JLArrays.JLArray(zeros(ComplexF64, length(θh), 2L + 1, 1))
+        PartialFSHT.rings_from_alm!(Gd, JLArrays.JLArray(almh), engd)
+        Test.@test Array(Gd) == Gh
+
+        ah = zeros(ComplexF64, PartialFSHT.coeff_size(L)..., 1)
+        PartialFSHT.alm_from_rings!(ah, Gh, engh)
+        ad = JLArrays.JLArray(zeros(ComplexF64, PartialFSHT.coeff_size(L)..., 1))
+        PartialFSHT.alm_from_rings!(ad, JLArrays.JLArray(Gh), engd)
+        Test.@test maximum(abs.(Array(ad) .- ah)) <= 1e-12 * maximum(abs.(ah))
+
+        # adjoint identity through the device engine alone
+        Gr = randn(ComplexF64, length(θh), 2L + 1, 1)
+        ar = JLArrays.JLArray(zeros(ComplexF64, PartialFSHT.coeff_size(L)..., 1))
+        PartialFSHT.alm_from_rings!(ar, JLArrays.JLArray(Gr), engd)
+        lhs = LinearAlgebra.dot(Gh, Gr)
+        rhs = LinearAlgebra.dot(almh, Array(ar))
+        Test.@test abs(lhs - rhs) <= 1e-11 * abs(lhs)
+    end
+end
+
 Test.@testset "DFS doubling is the transpose of folding" begin
     Random.seed!(86)
     Nθ, Nφ, B = 6, 10, 1
@@ -108,5 +145,64 @@ Test.@testset "DFS doubling is the transpose of folding" begin
         PartialFSHT.dfs_fold!(Gf, G, s)
         Test.@test abs(LinearAlgebra.dot(Fd, G) - LinearAlgebra.dot(F, Gf)) <
                    1e-12 * abs(LinearAlgebra.dot(Fd, G))
+    end
+end
+
+Test.@testset "threaded ring pass equals serial bit-for-bit" begin
+    # Orders are independent and each is summed in the same order regardless of which task runs
+    # it, so the threaded walk must agree *exactly*, not to a tolerance. Anything else means a
+    # shared scratch buffer or a reordered reduction.
+    Random.seed!(87)
+    be_s = ComputationalBackends.SerialBackend()
+    be_t = ComputationalBackends.ThreadedBackend()
+    for L in (64, 257)
+        θr = sort(0.01 .+ 0.5 .* rand(53))
+        alm = zeros(ComplexF64, PartialFSHT.coeff_size(L)..., 1)
+        for ℓ in 0:L, m in -ℓ:ℓ
+            alm[PartialFSHT.sph_mode(ℓ, m), 1] = randn(ComplexF64)
+        end
+
+        eng = PartialFSHT.RingLegendre(θr, L, 1e-8; ntrans = 1)
+        Gs = zeros(ComplexF64, length(θr), 2L + 1, 1)
+        Gt = similar(Gs)
+        PartialFSHT.rings_from_alm!(Gs, alm, eng, be_s)
+        PartialFSHT.rings_from_alm!(Gt, alm, eng, be_t)
+        Test.@test Gs == Gt
+
+        as = zeros(ComplexF64, PartialFSHT.coeff_size(L)..., 1)
+        at = similar(as)
+        PartialFSHT.alm_from_rings!(as, Gs, eng, be_s)
+        PartialFSHT.alm_from_rings!(at, Gs, eng, be_t)
+        Test.@test as == at
+
+        for s in (1, -2)
+            seng = PartialFSHT.SpinRings(θr, L, s, 1e-8; ntrans = 1)
+            Hs = zeros(ComplexF64, length(θr), 2L + 1, 1)
+            Ht = similar(Hs)
+            PartialFSHT.spin_rings_from_alm!(Hs, alm, seng, be_s)
+            PartialFSHT.spin_rings_from_alm!(Ht, alm, seng, be_t)
+            Test.@test Hs == Ht
+        end
+    end
+end
+
+Test.@testset "threaded stretch apply equals serial" begin
+    Random.seed!(88)
+    L = 512
+    n = 400
+    θ = (20 * π / 180) .* sqrt.(rand(n))
+    φ = 2π .* rand(n)
+    kw = (lmax = L, method = PartialFSHT.StretchAlgorithm(),
+          nufft = PartialFSHT.DirectSumBackend(), tol = 1e-8)
+    ps = PartialFSHT.Plan(θ, φ; kw..., backend = ComputationalBackends.SerialBackend())
+    pt = PartialFSHT.Plan(θ, φ; kw..., backend = ComputationalBackends.ThreadedBackend())
+    alm = rand_alm(L)
+    Test.@test maximum(abs.((pt * alm) .- (ps * alm))) == 0
+    fr = randn(ComplexF64, n)
+    Test.@test maximum(abs.((pt' * fr) .- (ps' * fr))) == 0
+    # thread count actually available, so a green suite at -t1 is not mistaken for coverage
+    Test.@test PartialFSHT.nslots(ps.leaf.eng) >= 1
+    if Threads.nthreads() > 1
+        Test.@test PartialFSHT.nslots(pt.leaf.eng) > 1
     end
 end

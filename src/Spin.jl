@@ -153,6 +153,13 @@ end
 # Spin ring engine: d^ℓ_{m,-s}(θ_j) contracted against spin coefficients
 # ---------------------------------------------------------------------------------------
 
+"""Recurrence state and partial sums for one ring chunk of the spin walk; one per task slot."""
+struct SpinScratch{T<:AbstractFloat, CT<:Complex, VT<:AbstractVector{T}, MT<:AbstractMatrix{CT}}
+    d1::VT
+    d0::VT
+    acc::MT
+end
+
 """
     SpinRings{T,CT}
 
@@ -171,13 +178,14 @@ struct SpinRings{T<:AbstractFloat, CT<:Complex, VT<:AbstractVector{T}, MT<:Abstr
     jlo::Vector{Int}
     jhi::Vector{Int}
     chunks::Vector{UnitRange{Int}}
-    d1::VT
-    d0::VT
-    acc::MT
+    slots::Vector{SpinScratch{T, CT, VT, MT}}
 end
 
+nslots(eng::SpinRings) = length(eng.slots)
+
 function SpinRings(θ::AbstractVector, lmax::Integer, spin::Integer, ε::Real;
-                   ntrans::Integer = 1, CT::Type = Complex{float(eltype(θ))})
+                   ntrans::Integer = 1, CT::Type = Complex{float(eltype(θ))},
+                   slots::Integer = max(1, Threads.nthreads()))
     T = float(eltype(θ))
     L = Int(lmax)
     s = Int(spin)
@@ -210,9 +218,12 @@ function SpinRings(θ::AbstractVector, lmax::Integer, spin::Integer, ε::Real;
     @inbounds for j in 1:nθ
         cosθ[j] = cos(T(θ[j]))
     end
-    return SpinRings{T, CT, typeof(cosθ), typeof(similar(θ, CT, cw, B))}(
-        L, s, B, T(ε), θ, cosθ, mlim, jlo, jhi, chunks,
-        similar(θ, T, cw), similar(θ, T, cw), similar(θ, CT, cw, B))
+    VT = typeof(cosθ)
+    MT = typeof(similar(θ, CT, cw, B))
+    sl = [SpinScratch{T, CT, VT, MT}(similar(θ, T, cw), similar(θ, T, cw),
+                                     similar(θ, CT, cw, B)) for _ in 1:max(1, Int(slots))]
+    return SpinRings{T, CT, VT, MT}(
+        L, s, B, T(ε), θ, cosθ, mlim, jlo, jhi, chunks, sl)
 end
 
 """
@@ -220,9 +231,10 @@ end
 
 `G[j, m+lmax+1, b] = Σ_ℓ ₛa_{ℓm} N_ℓ d^ℓ_{m,−s}(θ_j)`.
 """
-function spin_rings_from_alm!(G, alm, eng::SpinRings)
+function spin_rings_from_alm!(G, alm, eng::SpinRings,
+                              backend = ComputationalBackends.SerialBackend())
     fill!(G, zero(eltype(G)))
-    _spin_walk!(_Fwd(), G, alm, eng)
+    _spin_walk!(_Fwd(), G, alm, eng, backend)
     return G
 end
 
@@ -231,29 +243,36 @@ end
 
 Exact transpose of [`spin_rings_from_alm!`](@ref).
 """
-function spin_alm_from_rings!(alm, G, eng::SpinRings)
+function spin_alm_from_rings!(alm, G, eng::SpinRings,
+                              backend = ComputationalBackends.SerialBackend())
     fill!(alm, zero(eltype(alm)))
-    _spin_walk!(_Adj(), G, alm, eng)
+    _spin_walk!(_Adj(), G, alm, eng, backend)
     return alm
 end
 
-function _spin_walk!(dir, G, alm, eng::SpinRings)
+function _spin_walk!(dir, G, alm, eng::SpinRings, backend)
+    _spin_walk_orders!(dir, G, alm, eng, (-eng.lmax):eng.lmax, eng.slots[1])
+    return nothing
+end
+
+"""Walk a subset of orders on one scratch slot; orders are independent."""
+function _spin_walk_orders!(dir, G, alm, eng::SpinRings, ms, sc::SpinScratch)
     L = eng.lmax
-    @inbounds for m in -L:L
+    @inbounds for m in ms
         idx = m + L + 1
         lo, hi = eng.jlo[idx], eng.jhi[idx]
         hi >= lo || continue
         for chunk in eng.chunks
             r = max(chunk.start, lo):min(chunk.stop, hi)
             isempty(r) && continue
-            _spin_chunk!(dir, G, alm, eng, m, r)
+            _spin_chunk!(dir, G, alm, eng, m, r, sc)
         end
     end
     return nothing
 end
 
 function _spin_chunk!(dir, G, alm, eng::SpinRings{T, CT}, m::Int,
-                      r::UnitRange{Int}) where {T, CT}
+                      r::UnitRange{Int}, sc::SpinScratch) where {T, CT}
     L = eng.lmax
     B = eng.ntrans
     off = L + 1
@@ -261,9 +280,9 @@ function _spin_chunk!(dir, G, alm, eng::SpinRings{T, CT}, m::Int,
     nr = length(r)
     l0 = max(abs(m), abs(n))
     l0 > L && return nothing
-    d1 = view(eng.d1, 1:nr)
-    d0 = view(eng.d0, 1:nr)
-    acc = view(eng.acc, 1:nr, 1:B)
+    d1 = view(sc.d1, 1:nr)
+    d0 = view(sc.d0, 1:nr)
+    acc = view(sc.acc, 1:nr, 1:B)
 
     # Shared seed exponent across the chunk. `_spin_seed_log` returns a natural log; the scale
     # is a power of two, so convert before rounding.
@@ -310,13 +329,45 @@ function _spin_chunk!(dir, G, alm, eng::SpinRings{T, CT}, m::Int,
         a1 = T(2 * Lc + 1) * T(Lc) * T(L1) / den
         a2 = T(2 * Lc + 1) * T(m) * T(n) / den
         a0 = T(L1) * sm0 * sn0 / den
-        @inbounds @simd for k in 1:nr
-            dn = (a1 * eng.cosθ[r[k]] - a2) * d1[k] - a0 * d0[k]
-            d0[k] = d1[k]
-            d1[k] = dn
+        cs = view(eng.cosθ, r)
+        # Same fusion as the scalar ring pass: consume the new `d` in the register that produced
+        # it. Worth ~1.25× there, and the recurrence here has the same shape.
+        if dir isa _Fwd && B == 1 && abs(m) <= L1
+            av = _spin_coeff(alm, L1, m, L, 1) * _Nℓ(T, L1)
+            if iszero(av)
+                @inbounds @simd for k in 1:nr
+                    dn = (a1 * cs[k] - a2) * d1[k] - a0 * d0[k]
+                    d0[k] = d1[k]
+                    d1[k] = dn
+                end
+            else
+                @inbounds @simd for k in 1:nr
+                    dn = (a1 * cs[k] - a2) * d1[k] - a0 * d0[k]
+                    d0[k] = d1[k]
+                    d1[k] = dn
+                    acc[k, 1] += av * dn
+                end
+            end
+            Lc = L1
+        elseif dir isa _Adj && B == 1 && abs(m) <= L1
+            s = zero(eltype(alm))
+            @inbounds @simd for k in 1:nr
+                dn = (a1 * cs[k] - a2) * d1[k] - a0 * d0[k]
+                d0[k] = d1[k]
+                d1[k] = dn
+                s += dn * acc[k, 1]
+            end
+            Lc = L1
+            _spin_coeff_add!(alm, L1, m, L, 1, s * exp2(E) * _Nℓ(T, L1))
+        else
+            @inbounds @simd for k in 1:nr
+                dn = (a1 * cs[k] - a2) * d1[k] - a0 * d0[k]
+                d0[k] = d1[k]
+                d1[k] = dn
+            end
+            Lc = L1
+            _spin_touch!(dir, alm, acc, d1, Lc, m, L, B, nr, E)
         end
-        Lc = L1
-        _spin_touch!(dir, alm, acc, d1, Lc, m, L, B, nr, E)
         steps += 1
         if steps == _RESCALE_STRIDE && Lc < L
             steps = 0

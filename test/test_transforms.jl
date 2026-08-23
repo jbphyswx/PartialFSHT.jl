@@ -155,6 +155,58 @@ Test.@testset "stretched leaf: ntrans batching" begin
     end
 end
 
+Test.@testset "Float32 end to end" begin
+    # Element types must survive the whole pipeline: a silent promotion to Float64 would look
+    # like it works while doubling memory traffic and halving throughput.
+    Random.seed!(38)
+    for L in (128, 256)
+        n = 120
+        θ64 = (20 * π / 180) .* sqrt.(rand(n))
+        φ64 = 2π .* rand(n)
+        alm64 = rand_alm(L)
+        pd = PartialFSHT.Plan(θ64, φ64; lmax = L, method = PartialFSHT.DirectAlgorithm())
+        fd = pd * alm64
+
+        θ32 = Float32.(θ64)
+        φ32 = Float32.(φ64)
+        alm32 = ComplexF32.(alm64)
+        p32 = PartialFSHT.Plan(θ32, φ32; lmax = L,
+                               method = PartialFSHT.StretchAlgorithm(),
+                               nufft = PartialFSHT.DirectSumBackend(), tol = 1.0f-6)
+        f32 = p32 * alm32
+        Test.@test eltype(f32) === ComplexF32
+        # The accuracy floor here is Float32 round-off accumulated over ~L² terms, not the
+        # requested tolerance, so the gate is that floor rather than `tol`.
+        Test.@test maximum(abs.(ComplexF64.(f32) .- fd)) / maximum(abs.(fd)) < 1e-3
+
+        fr = randn(ComplexF32, n)
+        a32 = p32' * fr
+        Test.@test eltype(a32) === ComplexF32
+        lhs = LinearAlgebra.dot(f32, fr)
+        rhs = LinearAlgebra.dot(alm32, a32)
+        Test.@test abs(lhs - rhs) / abs(lhs) < 1e-4
+    end
+
+    Test.@testset "Float32 oracle" begin
+        L, n = 32, 40
+        θ32 = Float32.(0.4 .* rand(n))
+        φ32 = Float32.(2π .* rand(n))
+        p = PartialFSHT.Plan(θ32, φ32; lmax = L, method = PartialFSHT.DirectAlgorithm())
+        alm = ComplexF32.(rand_alm(L))
+        f = p * alm
+        Test.@test eltype(f) === ComplexF32
+        ref = zeros(ComplexF64, n)
+        for ℓ in 0:L, m in -ℓ:ℓ
+            c = ComplexF64(alm[PartialFSHT.sph_mode(ℓ, m)])
+            iszero(c) && continue
+            for i in 1:n
+                ref[i] += c * PartialFSHT.ylm(ℓ, m, Float64(θ32[i]), Float64(φ32[i]))
+            end
+        end
+        Test.@test maximum(abs.(ComplexF64.(f) .- ref)) / maximum(abs.(ref)) < 1e-4
+    end
+end
+
 Test.@testset "multi-box leaf: two caps" begin
     Random.seed!(37)
     L, tol = 256, 1e-8

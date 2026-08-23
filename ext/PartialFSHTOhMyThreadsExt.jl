@@ -15,6 +15,45 @@ using ComputationalBackends: ComputationalBackends
 using LinearAlgebra: LinearAlgebra
 using OhMyThreads: OhMyThreads
 
+# ---------------------------------------------------------------------------------------
+# The ring pass, threaded over spherical harmonic order.
+#
+# Orders are independent: going forward, order m writes only G[:, ±m]; coming back it writes only
+# the (ℓ, ±m) coefficients. So the loop parallelises without reduction, and the only thing that
+# ever made it serial was a single shared scratch buffer — now one per task slot.
+#
+# Orders are interleaved rather than blocked, because the work at order m falls off like
+# lmax - m and contiguous blocks would leave the last task with almost nothing to do. Exactly
+# one task per slot, so no two tasks share a buffer.
+# ---------------------------------------------------------------------------------------
+
+function PartialFSHT._walk_rings!(dir, G, alm, eng::PartialFSHT.RingLegendre,
+                                  ::ComputationalBackends.AbstractThreadedBackend)
+    ns = min(PartialFSHT.nslots(eng), eng.lmax + 1)
+    if ns <= 1
+        PartialFSHT._walk_orders!(dir, G, alm, eng, 0:eng.lmax, eng.slots[1])
+        return nothing
+    end
+    OhMyThreads.@tasks for t in 1:ns
+        PartialFSHT._walk_orders!(dir, G, alm, eng, (t - 1):ns:eng.lmax, eng.slots[t])
+    end
+    return nothing
+end
+
+function PartialFSHT._spin_walk!(dir, G, alm, eng::PartialFSHT.SpinRings,
+                                 ::ComputationalBackends.AbstractThreadedBackend)
+    L = eng.lmax
+    ns = min(PartialFSHT.nslots(eng), 2L + 1)
+    if ns <= 1
+        PartialFSHT._spin_walk_orders!(dir, G, alm, eng, (-L):L, eng.slots[1])
+        return nothing
+    end
+    OhMyThreads.@tasks for t in 1:ns
+        PartialFSHT._spin_walk_orders!(dir, G, alm, eng, (-L + t - 1):ns:L, eng.slots[t])
+    end
+    return nothing
+end
+
 function PartialFSHT._mul_plan_threaded!(f, plan::PartialFSHT.Plan, alm,
                                          ::ComputationalBackends.AbstractThreadedBackend)
     return _threaded_synthesize!(f, alm, plan.leaf, plan)
@@ -34,7 +73,8 @@ function _threaded_synthesize!(f, alm, leaf::PartialFSHT.MultiBoxLeaf, plan)
         sub = leaf.leaves[i]
         fg = leaf.fgs[i]
         fill!(fg, zero(eltype(fg)))
-        PartialFSHT.synthesize_stretch!(fg, alm, sub)
+        PartialFSHT.synthesize_stretch!(fg, alm, sub,
+                                        ComputationalBackends.SerialBackend())
         @inbounds if ndims(f) == 1
             for (j, k) in enumerate(g)
                 f[k] = fg[j, 1]
@@ -78,7 +118,8 @@ function _threaded_adjoint!(alm, f, leaf::PartialFSHT.MultiBoxLeaf, plan)
                     fg[j, b] = f[k, b]
                 end
             end
-            PartialFSHT.adjoint_stretch!(acc, fg, sub)
+            PartialFSHT.adjoint_stretch!(acc, fg, sub,
+                                         ComputationalBackends.SerialBackend())
             sum_t .+= acc
         end
     end

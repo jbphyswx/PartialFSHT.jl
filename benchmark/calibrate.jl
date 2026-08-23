@@ -18,6 +18,8 @@ Run with the test environment, which carries NUFSHT and a NUFFT backend:
 using PartialFSHT: PartialFSHT
 using NUFSHT: NUFSHT
 using NonuniformFFTs: NonuniformFFTs
+using OhMyThreads: OhMyThreads
+using ComputationalBackends: ComputationalBackends
 using LinearAlgebra: LinearAlgebra
 using Random: Random
 using Printf: @printf, @sprintf
@@ -57,12 +59,16 @@ end
 
 """Per-stage timing of one stretched-leaf synthesis, so a regression is attributable."""
 function stage_times(leaf, alm3)
-    tr = best(() -> PF._fill_rings!(leaf.G, alm3, leaf.eng))
+    ser = ComputationalBackends.SerialBackend()
+    thr = ComputationalBackends.ThreadedBackend()
+    tr = best(() -> PF._fill_rings!(leaf.G, alm3, leaf.eng, ser))
+    trt = Threads.nthreads() > 1 ?
+        best(() -> PF._fill_rings!(leaf.G, alm3, leaf.eng, thr)) : tr
     tg = best(() -> PF._rings_to_grid!(leaf.F, leaf.G, leaf.lmax, leaf.ring_bfft, leaf.Fφ))
     tp = best(() -> PF._periodize!(leaf.F̃, leaf.F, leaf.geomθ, leaf.spin))
     tf = best(() -> LinearAlgebra.mul!(leaf.Fhat, leaf.fft_plan, leaf.F̃))
     tn = best(() -> PF._nufft_exec!(leaf.nufft2, leaf.Fhat, leaf.fbuf))
-    return (ring = tr, phi = tg, dfs = tp, fft = tf, nufft = tn)
+    return (ring = tr, ring_thr = trt, phi = tg, dfs = tp, fft = tf, nufft = tn)
 end
 
 function run_L(L, nufft)
@@ -74,10 +80,23 @@ function run_L(L, nufft)
     alm3 = reshape(alm, size(alm)..., 1)
 
     ts_setup = @elapsed ps = PF.Plan(θ, φ; lmax = L, method = PF.StretchAlgorithm(),
-                                     nufft = nufft, tol = TOL)
+                                     nufft = nufft, tol = TOL,
+                                     backend = ComputationalBackends.SerialBackend())
     f = zeros(ComplexF64, M)
     ts = best(() -> LinearAlgebra.mul!(f, ps, alm))
-    ta = best(() -> LinearAlgebra.mul!(alm, ps', f))
+    # The adjoint writes coefficients, so it needs its own destination: timing it into `alm`
+    # would corrupt the input before the threaded comparison below reads it.
+    almadj = similar(alm)
+    ta = best(() -> LinearAlgebra.mul!(almadj, ps', f))
+    tt = ts
+    if Threads.nthreads() > 1
+        pt = PF.Plan(θ, φ; lmax = L, method = PF.StretchAlgorithm(), nufft = nufft,
+                     tol = TOL, backend = ComputationalBackends.ThreadedBackend())
+        ft = zeros(ComplexF64, M)
+        tt = best(() -> LinearAlgebra.mul!(ft, pt, alm))
+        maximum(abs.(ft .- f)) == 0 ||
+            @printf("    WARNING: threaded result differs from serial at L=%d\n", L)
+    end
     leaf = ps.leaf
     st = stage_times(leaf, alm3)
 
@@ -97,16 +116,17 @@ function run_L(L, nufft)
 
     @printf("L=%5d M=%8d | leaf: K=%4d nth=%5d nphi=%5d ring_work=%.3e\n",
             L, M, leaf.geomθ.K, leaf.nθ, leaf.nφ, Float64(PF.ring_work(ps)))
-    @printf("            | stretch  setup %7.3f s   synth %8.4f s   adj %8.4f s\n",
-            ts_setup, ts, ta)
-    @printf("            |   stages ring %7.4f  phi %7.4f  dfs %7.4f  fft %7.4f  nufft %7.4f\n",
-            st.ring, st.phi, st.dfs, st.fft, st.nufft)
+    @printf("            | stretch  setup %7.3f s   synth %8.4f s   adj %8.4f s   threaded %8.4f s (%.2fx)\n",
+            ts_setup, ts, ta, tt, ts / tt)
+    @printf("            |   stages ring %7.4f (thr %7.4f, %.2fx)  phi %7.4f  dfs %7.4f  fft %7.4f  nufft %7.4f\n",
+            st.ring, st.ring_thr, st.ring / st.ring_thr, st.phi, st.dfs, st.fft, st.nufft)
     if isfinite(tn)
         @printf("            | NUFSHT   setup %7.3f s   synth %8.4f s   -> speedup %6.2fx\n",
                 tn_setup, tn, tn / ts)
     end
     println()
-    return (L = L, M = M, ts = ts, ta = ta, tn = tn, ring_work = PF.ring_work(ps), stages = st)
+    return (L = L, M = M, ts = ts, ta = ta, tt = tt, tn = tn,
+            ring_work = PF.ring_work(ps), stages = st)
 end
 
 function calibrate_constants(rows)
@@ -137,11 +157,13 @@ function main()
     calibrate_constants(rows)
     println()
     println("summary (synthesis):")
-    @printf("%6s %10s %12s %12s %10s\n", "L", "M", "stretch s", "NUFSHT s", "speedup")
+    @printf("%6s %10s %12s %12s %12s %10s %10s\n",
+            "L", "M", "serial s", "threaded s", "NUFSHT s", "vs serial", "vs threaded")
     for r in rows
-        @printf("%6d %10d %12.4f %12s %10s\n", r.L, r.M, r.ts,
+        @printf("%6d %10d %12.4f %12.4f %12s %10s %10s\n", r.L, r.M, r.ts, r.tt,
                 isfinite(r.tn) ? @sprintf("%.4f", r.tn) : "-",
-                isfinite(r.tn) ? @sprintf("%.2fx", r.tn / r.ts) : "-")
+                isfinite(r.tn) ? @sprintf("%.2fx", r.tn / r.ts) : "-",
+                isfinite(r.tn) ? @sprintf("%.2fx", r.tn / r.tt) : "-")
     end
     return rows
 end

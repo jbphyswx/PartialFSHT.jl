@@ -21,18 +21,38 @@ LinearAlgebra.mul!(alm, plan', f)     # exact adjoint
 ## Performance
 
 Synthesis on a 20° polar cap with `M ≈ 4(L·θ⋆)²` points, `tol = 1e-8`, against a full-sphere
-`NUFSHT.nusht_type2!` on the *same* points. Measured by `benchmark/calibrate.jl`; the machine
-was under other load, so both columns are pessimistic.
+`NUFSHT.nusht_type2!` on the *same* points. Measured by `benchmark/calibrate.jl` at 8 threads
+(both sides thread); the machine was under other load, so absolute times are pessimistic.
 
-| `lmax` | `M` | PartialFSHT | NUFSHT | speedup |
-| ---: | ---: | ---: | ---: | ---: |
-| 256 | 3.2e4 | 14.2 ms | 55.8 ms | 3.9× |
-| 512 | 1.3e5 | 40.3 ms | 218 ms | 5.4× |
-| 1024 | 5.1e5 | 208 ms | 1.22 s | 5.9× |
-| 2048 | 2.0e6 | 1.01 s | 6.54 s | 6.5× |
+| `lmax` | `M` | serial | threaded | NUFSHT | vs serial | vs threaded |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 | 3.2e4 | 6.2 ms | 4.0 ms | 17.5 ms | 2.8× | 4.4× |
+| 512 | 1.3e5 | 23.0 ms | 13.9 ms | 84.8 ms | 3.7× | 6.1× |
+| 1024 | 5.1e5 | 128 ms | 65 ms | 416 ms | 3.3× | 6.4× |
+| 2048 | 2.0e6 | 633 ms | 286 ms | 2.61 s | 4.1× | 9.1× |
 
-Plan construction is 5.3 s versus 40 s at `lmax = 2048`. Applies allocate nothing after
-construction, in both directions and for every leaf.
+Plan construction is 6.2 s versus 75 s at `lmax = 2048`.
+
+Threading is over spherical harmonic order in the ring pass, which scales at **3.99× on 4
+physical cores** (8 logical) and gives 2.0–2.2× end to end — the NUFFT is now the co-equal share
+of an apply. The threaded result is **bit-identical** to the serial one, since orders are
+independent and each is summed in the same sequence regardless of which task runs it.
+
+Batching raises arithmetic intensity, because one `P̄` value then feeds `2·ntrans` accumulations
+against unchanged recurrence-state traffic: `ntrans = 4` costs 1.43 ns per retained
+`(degree, order, ring)` triple against 1.54 ns at `ntrans = 1`.
+
+The speedup is close to **independent of point density**. Sweeping `M` over a 16× range at
+`lmax = 2048` moves it only within measurement scatter (8–12×, against 2.5–3.3 s of run-to-run
+variation in the NUFSHT baseline on a shared machine), and the NUFFT stage grows just 1.36× over
+that range — it is dominated by its internal oversampled FFT on the reduced grid rather than by
+point spreading. So a Nyquist-sampled patch and a 4×-oversampled one cost about the same, and the
+table above is not an artefact of its sampling choice.
+
+Applies allocate nothing after construction — both directions, every leaf, at any thread count.
+FFT plans are deliberately built single-threaded: a multithreaded FFTW plan spawns Julia tasks on
+every execution (4 kB per 2-D transform), and the FFT is 2% of an apply while the ring pass, which
+is threaded directly, is 56%. Pass `fft_threads` to override.
 
 ## Accuracy
 
@@ -83,7 +103,37 @@ Spin-`s` uses the same `Plan(...; spin = s)`; the Wigner-`d` there is the spin a
 associated Legendre function (a degree recurrence at fixed `(m,−s)`), not a rotation.
 
 NUFFT backends are types: `DirectSumBackend()` (reference), `FINUFFTBackend()`,
-`NonuniformFFTsBackend()`, `AutoNUFFT()`. Execution backends come from ComputationalBackends.
+`NonuniformFFTsBackend()`, `AutoNUFFT()`. `AutoNUFFT` errors when no fast backend is loaded
+rather than silently selecting the `O(M·n₁n₂)` reference — and only leaves that use a NUFFT
+demand one, so a `DirectAlgorithm` plan needs no extension.
+
+## Parallelism and devices
+
+Execution backends come from ComputationalBackends.
+
+| backend | what it parallelises | needs |
+| --- | --- | --- |
+| `SerialBackend` | — | — |
+| `ThreadedBackend` | spherical harmonic order in the ring pass; boxes in a multi-box leaf | `using OhMyThreads` |
+| `MPIBackend` | points across ranks — synthesis local, adjoint `Allreduce`d | `using MPI` |
+| `DistributedBackend` | independent node sets across worker processes, via `mul_nodeset` | `using Distributed` |
+
+The ring pass and the DFS periodisation are KernelAbstractions kernels, so they run on any
+device backend (`using KernelAbstractions`). The ring kernel parallelises over `(ring, order)`
+with the whole recurrence state — including the block-scaling exponent — in registers; the
+forward direction is race-free and reproduces the host result bit-for-bit, the adjoint scatters
+through atomic adds and so agrees to round-off.
+
+**Validation status of the device path is worth being precise about.** The ring pass and DFS are
+tested against the host on `JLArrays` in the normal suite. The FFT and NUFFT stages cannot be
+exercised there — `JLArrays` provides no FFT — so an end-to-end device transform needs real
+hardware. Two test entry points are deliberately separate from `runtests.jl`, because a
+single-rank or CPU-only run of them would assert nothing:
+
+```
+mpiexec -n 2 julia --project=test test/mpi_ranks.jl    # MPI point decomposition
+julia --project=test benchmark/calibrate.jl            # performance contract + cost constants
+```
 
 ## What partial data can and cannot give you
 

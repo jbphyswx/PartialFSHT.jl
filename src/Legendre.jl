@@ -70,6 +70,19 @@ function polar_mmax(θ::Real, lmax::Integer, ε::Real; pad_factor::Real = polar_
 end
 
 """
+Recurrence state and partial sums for one ring chunk. One per task slot: the `m` loop is
+embarrassingly parallel — distinct orders touch distinct `G` columns going forward and distinct
+coefficient entries coming back — so the only thing standing between it and a thread is that the
+scratch used to be shared.
+"""
+struct RingScratch{T<:AbstractFloat, CT<:Complex, VT<:AbstractVector{T}, MT<:AbstractMatrix{CT}}
+    p1::VT
+    p2::VT
+    accp::MT
+    accm::MT
+end
+
+"""
     RingLegendre{T,CT}
 
 Ring geometry, polar-optimisation ranges, chunking, and apply scratch for the scaled ALF
@@ -82,7 +95,8 @@ recurrence. Built once per ring set; `θ` must be sorted ascending.
 The retained ring set for an order is contiguous because `{θ : sinθ ≥ c}` is an interval,
 which holds whether the rings lie north of the equator, south of it, or straddle it.
 """
-struct RingLegendre{T<:AbstractFloat, CT<:Complex, VT<:AbstractVector{T}, MT<:AbstractMatrix{CT}}
+struct RingLegendre{T<:AbstractFloat, CT<:Complex, VT<:AbstractVector{T},
+                    MT<:AbstractMatrix{CT}, VI<:AbstractVector{Int}}
     lmax::Int
     ntrans::Int
     ε::T
@@ -91,18 +105,20 @@ struct RingLegendre{T<:AbstractFloat, CT<:Complex, VT<:AbstractVector{T}, MT<:Ab
     sinθ::VT
     log2sinθ::VT
     log2c::VT
-    mlim::Vector{Int}
-    jlo::Vector{Int}
+    mlim::VI              # follows the node array type, so a device kernel can read it
+    mmax::Int
+    jlo::Vector{Int}      # host-side loop bounds
     jhi::Vector{Int}
     chunks::Vector{UnitRange{Int}}
-    p1::VT
-    p2::VT
-    accp::MT
-    accm::MT
+    slots::Vector{RingScratch{T, CT, VT, MT}}
 end
 
+"""Number of independent task slots the ring pass can use."""
+nslots(eng::RingLegendre) = length(eng.slots)
+
 function RingLegendre(θ::AbstractVector, lmax::Integer, ε::Real;
-                      ntrans::Integer = 1, CT::Type = Complex{float(eltype(θ))})
+                      ntrans::Integer = 1, CT::Type = Complex{float(eltype(θ))},
+                      slots::Integer = max(1, Threads.nthreads()))
     T = float(eltype(θ))
     L = Int(lmax)
     L >= 0 || throw(ArgumentError("lmax must be nonnegative"))
@@ -112,18 +128,25 @@ function RingLegendre(θ::AbstractVector, lmax::Integer, ε::Real;
     nθ >= 1 || throw(ArgumentError("need at least one ring"))
     issorted(θ) || throw(ArgumentError("ring colatitudes must be sorted ascending"))
 
-    cosθ = similar(θ, T)
-    sinθ = similar(θ, T)
-    log2sinθ = similar(θ, T)
+    # Everything derived from the ring set is built on the host and transferred once. The
+    # geometry is a plan-time O(nθ + L) computation, so doing it with scalar indexing is free —
+    # and doing it *on* a device array would be scalar iteration on the GPU.
+    θh = T.(_host(θ))
+    cosθ_h = similar(θh)
+    sinθ_h = similar(θh)
+    log2sinθ_h = similar(θh)
     @inbounds for j in 1:nθ
-        s, c = sincos(T(θ[j]))
+        s, c = sincos(θh[j])
         as = abs(s)
-        sinθ[j] = as
-        cosθ[j] = c
-        log2sinθ[j] = as > 0 ? log2(as) : T(-Inf)
+        sinθ_h[j] = as
+        cosθ_h[j] = c
+        log2sinθ_h[j] = as > 0 ? log2(as) : T(-Inf)
     end
+    cosθ = _to_like(θ, cosθ_h)
+    sinθ = _to_like(θ, sinθ_h)
+    log2sinθ = _to_like(θ, log2sinθ_h)
 
-    mlim = [polar_mmax(T(θ[j]), L, ε) for j in 1:nθ]
+    mlim = [polar_mmax(θh[j], L, ε) for j in 1:nθ]
 
     jlo = fill(1, L + 1)
     jhi = fill(0, L + 1)
@@ -141,25 +164,29 @@ function RingLegendre(θ::AbstractVector, lmax::Integer, ε::Real;
 
     # log2 of the sectorial prefactor c_m = (1/√(4π)) Π_{k=1}^m √((2k+1)/(2k)), accumulated in
     # log space so it cannot under/overflow. The (-1)^m sign is applied at use.
-    log2c = similar(θ, T, L + 1)
+    log2c_h = Vector{T}(undef, L + 1)
     acc = -log2(sqrt(4 * T(π)))
-    log2c[1] = acc
+    log2c_h[1] = acc
     @inbounds for m in 1:L
         acc += log2(sqrt(T(2m + 1) / T(2m)))
-        log2c[m + 1] = acc
+        log2c_h[m + 1] = acc
     end
+    log2c = _to_like(θ, log2c_h)
 
-    chunks = _ring_chunks(sinθ, mlim)
+    chunks = _ring_chunks(sinθ_h, mlim)
     cw = min(_CHUNK_MAX, maximum(length, chunks))
 
-    p1 = similar(θ, T, cw)
-    p2 = similar(θ, T, cw)
-    accp = similar(θ, CT, cw, B)
-    accm = similar(θ, CT, cw, B)
+    ns = max(1, Int(slots))
+    VT = typeof(cosθ)
+    MT = typeof(similar(θ, CT, cw, B))
+    sl = [RingScratch{T, CT, VT, MT}(similar(θ, T, cw), similar(θ, T, cw),
+                                     similar(θ, CT, cw, B), similar(θ, CT, cw, B))
+          for _ in 1:ns]
+    mlim_dev = _to_like(θ, mlim)
 
-    return RingLegendre{T, CT, typeof(cosθ), typeof(accp)}(
-        L, B, T(ε), θ, cosθ, sinθ, log2sinθ, log2c, mlim, jlo, jhi, chunks,
-        p1, p2, accp, accm)
+    return RingLegendre{T, CT, VT, MT, typeof(mlim_dev)}(
+        L, B, T(ε), θ, cosθ, sinθ, log2sinθ, log2c, mlim_dev, maximum(mlim),
+        jlo, jhi, chunks, sl)
 end
 
 """
@@ -215,7 +242,8 @@ struct _Adj end
 `m`, all batch members. Entries outside the retained set are zero. Bang-first; allocation-free
 after construction.
 """
-function rings_from_alm!(G, alm, eng::RingLegendre)
+function rings_from_alm!(G, alm, eng::RingLegendre,
+                         backend = ComputationalBackends.SerialBackend())
     L = eng.lmax
     B = _ntrans(alm)
     B == eng.ntrans || throw(DimensionMismatch("alm carries $B transforms, engine built for $(eng.ntrans)"))
@@ -225,7 +253,7 @@ function rings_from_alm!(G, alm, eng::RingLegendre)
     size(G, 2) == 2L + 1 ||
         throw(DimensionMismatch("G has $(size(G,2)) orders, expected $(2L+1)"))
     fill!(G, zero(eltype(G)))
-    _walk_rings!(_Fwd(), G, alm, eng)
+    _walk_rings!(_Fwd(), G, alm, eng, backend)
     return G
 end
 
@@ -236,40 +264,52 @@ Exact transpose of [`rings_from_alm!`](@ref):
 `a_{ℓm} = Σ_j P̄_ℓ^m(cosθ_j) G[j, m+lmax+1, b]` over the same retained set, so the pair
 satisfies the adjoint identity to round-off.
 """
-function alm_from_rings!(alm, G, eng::RingLegendre)
+function alm_from_rings!(alm, G, eng::RingLegendre,
+                         backend = ComputationalBackends.SerialBackend())
     L = eng.lmax
     B = size(G, 3)
     B == eng.ntrans || throw(DimensionMismatch("G carries $B transforms, engine built for $(eng.ntrans)"))
     _assert_coeffs(alm, L, B)
     fill!(alm, zero(eltype(alm)))
-    _walk_rings!(_Adj(), G, alm, eng)
+    _walk_rings!(_Adj(), G, alm, eng, backend)
     return alm
 end
 
-function _walk_rings!(dir, G, alm, eng::RingLegendre)
-    @inbounds for m in 0:eng.lmax
+# Serial walk; the OhMyThreads extension overrides this for a threaded backend.
+function _walk_rings!(dir, G, alm, eng::RingLegendre, backend)
+    _walk_orders!(dir, G, alm, eng, 0:eng.lmax, eng.slots[1])
+    return nothing
+end
+
+"""
+Walk a subset of orders on one scratch slot. Orders are independent, so a caller may hand
+disjoint `ms` to different tasks; interleaving (`t:nslots:lmax`) balances better than contiguous
+blocks because the work at order `m` falls off like `lmax - m`.
+"""
+function _walk_orders!(dir, G, alm, eng::RingLegendre, ms, sc::RingScratch)
+    @inbounds for m in ms
         lo, hi = eng.jlo[m + 1], eng.jhi[m + 1]
         hi >= lo || continue
         for chunk in eng.chunks
             r = max(chunk.start, lo):min(chunk.stop, hi)
             isempty(r) && continue
-            _ring_chunk!(dir, G, alm, eng, m, r)
+            _ring_chunk!(dir, G, alm, eng, m, r, sc)
         end
     end
     return nothing
 end
 
 function _ring_chunk!(dir, G, alm, eng::RingLegendre{T, CT}, m::Int,
-                      r::UnitRange{Int}) where {T, CT}
+                      r::UnitRange{Int}, sc::RingScratch) where {T, CT}
     L = eng.lmax
     B = eng.ntrans
     off = L + 1
     nr = length(r)
     sgn = iseven(m) ? one(T) : -one(T)
-    p1 = view(eng.p1, 1:nr)
-    p2 = view(eng.p2, 1:nr)
-    accp = view(eng.accp, 1:nr, 1:B)
-    accm = view(eng.accm, 1:nr, 1:B)
+    p1 = view(sc.p1, 1:nr)
+    p2 = view(sc.p2, 1:nr)
+    accp = view(sc.accp, 1:nr, 1:B)
+    accm = view(sc.accm, 1:nr, 1:B)
 
     E = _seed_exponent(eng, m, r)
     @inbounds for (k, j) in enumerate(r)
@@ -295,17 +335,52 @@ function _ring_chunk!(dir, G, alm, eng::RingLegendre{T, CT}, m::Int,
         end
         _touch!(dir, alm, accp, accm, p1, m + 1, m, B, sgn, nr, E)
 
+        cs = view(eng.cosθ, r)
         steps = 0
         for ℓ in (m + 2):L
             a = sqrt(T(2ℓ - 1) * T(2ℓ + 1) / (T(ℓ - m) * T(ℓ + m)))
             b = sqrt(T(2ℓ + 1) / T(2ℓ - 3) * T(ℓ - m - 1) / T(ℓ - m) *
                      T(ℓ + m - 1) / T(ℓ + m))
-            @inbounds @simd for k in 1:nr
-                p = a * eng.cosθ[r[k]] * p1[k] - b * p2[k]
-                p2[k] = p1[k]
-                p1[k] = p
+            if dir isa _Fwd && B == 1
+                # Single-transform forward: fuse the recurrence with its accumulation so the new
+                # `P̄` value is consumed in the register that produced it. Measured ~10% over the
+                # two-pass form; the state stays L1-resident either way, so this is the whole win
+                # available from restructuring — a register-resident kernel with the degree loop
+                # innermost measured *2× worse*, because it caps SIMD at the unroll width while
+                # the loop below vectorises across the entire ring chunk.
+                ap = _coeff(alm, ℓ, m, 1)
+                am = m == 0 ? zero(ap) : _coeff(alm, ℓ, -m, 1)
+                ams = am * sgn
+                @inbounds @simd for k in 1:nr
+                    p = a * cs[k] * p1[k] - b * p2[k]
+                    p2[k] = p1[k]
+                    p1[k] = p
+                    accp[k, 1] += ap * p
+                    accm[k, 1] += ams * p
+                end
+            elseif dir isa _Adj && B == 1
+                # Single-transform adjoint: the same fusion, with a reduction in place of an
+                # accumulation. `accp`/`accm` hold the ring data and are read-only here.
+                f = exp2(E)
+                sp = zero(eltype(alm))
+                sm = zero(eltype(alm))
+                @inbounds @simd for k in 1:nr
+                    p = a * cs[k] * p1[k] - b * p2[k]
+                    p2[k] = p1[k]
+                    p1[k] = p
+                    sp += p * accp[k, 1]
+                    sm += p * accm[k, 1]
+                end
+                _coeff_add!(alm, ℓ, m, 1, sp * f)
+                m > 0 && _coeff_add!(alm, ℓ, -m, 1, sm * sgn * f)
+            else
+                @inbounds @simd for k in 1:nr
+                    p = a * cs[k] * p1[k] - b * p2[k]
+                    p2[k] = p1[k]
+                    p1[k] = p
+                end
+                _touch!(dir, alm, accp, accm, p1, ℓ, m, B, sgn, nr, E)
             end
-            _touch!(dir, alm, accp, accm, p1, ℓ, m, B, sgn, nr, E)
             steps += 1
             if steps == _RESCALE_STRIDE && ℓ < L
                 steps = 0
