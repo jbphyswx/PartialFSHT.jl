@@ -1,0 +1,105 @@
+name: CI
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    name: test ${{ matrix.version }} - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.11 is the floor: `[workspace]` and the sub-environment `[sources]` entries this
+        # package relies on are 1.11 features. '1' is latest stable; nightly is early warning
+        # and does not block.
+        version: ['1.11', '1']
+        os: [ubuntu-latest, macos-latest]
+        include:
+          - version: 'nightly'
+            os: ubuntu-latest
+    continue-on-error: ${{ matrix.version == 'nightly' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      # Coverage is the CodeCov workflow's job. Instrumentation takes this suite from 1m40 to
+      # 4m26, and this matrix runs it five times over. It does *not* invalidate the allocation
+      # gates — the full suite passes under `--code-coverage=user`, checked — so the split is for
+      # wall-clock only and the tests that run are identical either way.
+      - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: false
+
+  # A single-threaded run cannot show the two properties the threaded path advertises: that its
+  # result is bit-identical to serial, and that its extra cost is a fixed task-spawn floor rather
+  # than growth. It also loads the OhMyThreads extension, which a 1-thread run leaves inert.
+  test-threaded:
+    name: test threaded (4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: false
+        env:
+          JULIA_NUM_THREADS: '4'
+
+  # `test/mpi_ranks.jl` is kept out of `runtests.jl` because a single-rank run of it asserts
+  # nothing — the adjoint's `Allreduce` is the whole point. So it needs its own job with a real
+  # communicator, or it is never exercised at all.
+  test-mpi:
+    name: test MPI (2 ranks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      - name: Instantiate test environment
+        # The sub-environments declare `[sources]` and the root declares `[workspace]`, so
+        # instantiate is all that is needed — `Pkg.develop` would only overwrite those with a
+        # machine-specific absolute path.
+        run: julia --project=test -e 'using Pkg; Pkg.instantiate()'
+      - name: Run the rank-decomposition tests
+        run: |
+          julia --project=test -e '
+            using MPI: MPI
+            run(`$(MPI.mpiexec()) -n 2 $(Base.julia_cmd()) --project=test test/mpi_ranks.jl`)'
+
+  examples:
+    name: examples
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      - name: Instantiate examples environment
+        run: julia --project=examples -e 'using Pkg; Pkg.instantiate()'
+      # `run_all.jl` runs each numbered example in order and exits nonzero if any fails. Each
+      # example asserts the property it demonstrates, so this is a behavioural check and not just
+      # a smoke test — globbing `examples/*.jl` instead would also re-run the runner itself.
+      - name: Run every example
+        run: julia --project=examples -t 4 examples/run_all.jl

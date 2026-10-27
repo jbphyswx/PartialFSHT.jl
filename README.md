@@ -1,5 +1,9 @@
 # PartialFSHT.jl
 
+[![Build Status](https://github.com/jbphyswx/PartialFSHT.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/jbphyswx/PartialFSHT.jl/actions/workflows/CI.yml)
+[![Dev Docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://jbphyswx.github.io/PartialFSHT.jl/dev/)
+[![Coverage](https://codecov.io/gh/jbphyswx/PartialFSHT.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/jbphyswx/PartialFSHT.jl)
+
 Partial-sky spherical harmonic transforms: the operator
 
 ```math

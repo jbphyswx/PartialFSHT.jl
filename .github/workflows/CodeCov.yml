@@ -1,0 +1,39 @@
+name: CodeCov
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Coverage is collected in its own job purely for wall-clock: instrumentation takes the suite from
+# 1m40 to 4m26, and the CI test matrix runs it several times over.
+#
+# It is *not* split because instrumentation breaks the allocation gates. That was checked here —
+# the full suite, including every `== 0` byte assertion in `test/test_allocs.jl`, passes under
+# `--code-coverage=user` — so if this job ever needs to change, it is not for that reason.
+jobs:
+  codecov:
+    name: coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: true
+      - uses: julia-actions/julia-processcoverage@v1
+      - uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+        continue-on-error: true
