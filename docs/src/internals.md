@@ -1,3 +1,7 @@
+```@meta
+CurrentModule = PartialFSHT
+```
+
 # Implementation notes
 
 What the code does and why, at the level a maintainer needs. The mathematics is in

@@ -1,3 +1,7 @@
+```@meta
+CurrentModule = PartialFSHT
+```
+
 # Theory
 
 ## The operator

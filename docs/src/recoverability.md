@@ -1,3 +1,7 @@
+```@meta
+CurrentModule = PartialFSHT
+```
+
 # Recoverability
 
 Synthesis and the adjoint are exact at any sky coverage. *Inversion* is not, and the distinction

@@ -1,3 +1,7 @@
+```@meta
+CurrentModule = PartialFSHT
+```
+
 # API
 
 ## The operator

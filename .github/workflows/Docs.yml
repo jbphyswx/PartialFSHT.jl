@@ -27,12 +27,9 @@ jobs:
       - uses: julia-actions/cache@v3
       - name: Instantiate docs environment
         run: julia --project=docs -e 'using Pkg; Pkg.instantiate()'
-      # `docs/make.jl` regenerates every figure from the package before building, so a figure
-      # cannot drift from the behaviour it illustrates — and a change that breaks one fails the
-      # docs build rather than silently shipping a stale plot. CairoMakie needs no display.
+      # Build from the committed figures; regeneration uses docs/generate_assets separately.
       - name: Build and deploy
         run: julia --project=docs docs/make.jl
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
-          GKSwstype: nul

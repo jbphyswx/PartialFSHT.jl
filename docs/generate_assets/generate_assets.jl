@@ -1,9 +1,12 @@
 """
 Generate the manual's figures into `docs/src/assets/`.
 
-Run standalone (`julia --project=docs docs/make_figures.jl`) or let `docs/make.jl` call it. Every
-panel is computed from the package rather than drawn by hand, so a figure cannot drift away from the
-behaviour it illustrates — if the window changes shape, the plot changes with it.
+Run explicitly from the repository root:
+
+    julia --project=docs/generate_assets docs/generate_assets/generate_assets.jl
+
+Every panel is computed from the package. Review and commit the generated PNGs with changes to the
+behaviour they illustrate. Documentation builds use those committed files without running this script.
 """
 
 using CairoMakie: CairoMakie
@@ -11,9 +14,8 @@ using PartialFSHT: PartialFSHT
 using LinearAlgebra: LinearAlgebra
 using Printf: Printf
 using Random: Random
-const PF = PartialFSHT
 
-const ASSETS = joinpath(@__DIR__, "src", "assets")
+const ASSETS = normpath(joinpath(@__DIR__, "..", "src", "assets"))
 mkpath(ASSETS)
 
 CairoMakie.activate!(; type = "png", px_per_unit = 2)
@@ -47,14 +49,14 @@ function fig_geometry()
     θ = θstar .* sqrt.(rand(n))
     φ = 2π .* rand(n)
     L, tol = 512, 1e-8
-    box = PF.bounding_box(θ, φ)
-    geom = PF.stretch_geometry(box.θlo, box.θhi, L, tol)
+    box = PartialFSHT.bounding_box(θ, φ)
+    geom = PartialFSHT.stretch_geometry(box.θlo, box.θhi, L, tol)
     # The ring count is the leaf's own, taken from the plan rather than chosen for drawing, so the
     # caption cannot claim a grid the transform does not build.
-    plan = PF.Plan(θ, φ; lmax = L, tol = tol, method = PF.StretchAlgorithm(),
-                   nufft = PF.DirectSumBackend())
+    plan = PartialFSHT.Plan(θ, φ; lmax = L, tol = tol, method = PartialFSHT.StretchAlgorithm(),
+                   nufft = PartialFSHT.DirectSumBackend())
     nrings = plan.leaf.nθ_half
-    θr, _ = PF.stretch_rings(geom, nrings)
+    θr, _ = PartialFSHT.stretch_rings(geom, nrings)
 
     fig = CairoMakie.Figure(size = (900, 380))
 
@@ -72,8 +74,8 @@ function fig_geometry()
 
     ax2 = CairoMakie.Axis(fig[1, 2]; title = "rings actually evaluated, and the window on them",
                xlabel = "colatitude θ  [rad]", ylabel = "window w(θ)")
-    Θr = [PF.theta_to_stretch(geom, t) for t in θr]
-    wr = [PF.stretch_window(geom, Θ) for Θ in Θr]
+    Θr = [PartialFSHT.theta_to_stretch(geom, t) for t in θr]
+    wr = [PartialFSHT.stretch_window(geom, Θ) for Θ in Θr]
     CairoMakie.vspan!(ax2, 0, box.θhi; color = (:steelblue, 0.12))
     CairoMakie.scatterlines!(ax2, θr, wr; color = :seagreen, markersize = 6)
     CairoMakie.text!(ax2, box.θhi / 2, 0.5; text = "data", align = (:center, :center), fontsize = 11,
@@ -84,7 +86,7 @@ function fig_geometry()
 
     CairoMakie.Label(fig[0, :], Printf.@sprintf("lmax = %d, tol = %.0e: %d rings and %d orders carry the whole \
                                transform (%.2e retained triples)",
-                              L, tol, nrings, plan.leaf.mmax, PF.ring_work(plan));
+                              L, tol, nrings, plan.leaf.mmax, PartialFSHT.ring_work(plan));
           fontsize = 14, font = :bold)
     save_fig("geometry.png", fig)
 end
@@ -103,9 +105,9 @@ function fig_window()
                yticks = ([0.05, 0.1, 0.25, 0.5, 1.0], ["0.05", "0.1", "0.25", "0.5", "1"]))
 
     for (i, tol) in enumerate((1e-4, 1e-8, 1e-12))
-        geom = PF.stretch_geometry(0.0, 0.35, 1024, tol)
+        geom = PartialFSHT.stretch_geometry(0.0, 0.35, 1024, tol)
         Θ = range(0, π; length = 600)
-        CairoMakie.lines!(ax1, Θ, [PF.stretch_window(geom, t) for t in Θ]; color = PALETTE[i],
+        CairoMakie.lines!(ax1, Θ, [PartialFSHT.stretch_window(geom, t) for t in Θ]; color = PALETTE[i],
                linewidth = 2, label = Printf.@sprintf("tol = %.0e  (Θ₁ = %.2f, σ = %.2f)",
                                                tol, geom.Θ1, geom.σ))
     end
@@ -113,7 +115,7 @@ function fig_window()
     CairoMakie.ylims!(ax1, -0.05, 1.08)
 
     for (i, tol) in enumerate((1e-4, 1e-8, 1e-12))
-        β = PF.es_beta(tol)
+        β = PartialFSHT.es_beta(tol)
         Lh = 10 .^ range(log10(2.2 * β), 4.5; length = 200)
         CairoMakie.lines!(ax2, Lh, sqrt.(2β ./ Lh); color = PALETTE[i], linewidth = 2,
                label = Printf.@sprintf("tol = %.0e", tol))
@@ -136,7 +138,7 @@ function fig_polar()
                xlabel = "colatitude θ  [rad]", ylabel = "m_max(θ)")
     θ = range(0.002, 0.6; length = 400)
     for (i, L) in enumerate((256, 1024, 4096))
-        CairoMakie.lines!(ax1, θ, [PF.polar_mmax(t, L, 1e-8) for t in θ]; color = PALETTE[i],
+        CairoMakie.lines!(ax1, θ, [PartialFSHT.polar_mmax(t, L, 1e-8) for t in θ]; color = PALETTE[i],
                linewidth = 2, label = "lmax = $L")
         CairoMakie.lines!(ax1, θ, [min(L, (L + 0.5) * sin(t)) for t in θ]; color = PALETTE[i],
                linewidth = 1, linestyle = :dot)
@@ -151,7 +153,7 @@ function fig_polar()
                xticks = ([100, 300, 1000, 3000, 10000], ["100", "300", "1000", "3000", "10⁴"]))
     ℓs = round.(Int, 10 .^ range(2, 4, length = 40))
     for (i, tol) in enumerate((1e-4, 1e-8, 1e-12))
-        pad = [PF.polar_mmax(0.394, L, tol) - (L + 0.5) * sin(0.394) for L in ℓs]
+        pad = [PartialFSHT.polar_mmax(0.394, L, tol) - (L + 0.5) * sin(0.394) for L in ℓs]
         CairoMakie.scatterlines!(ax2, ℓs, pad; color = PALETTE[i], markersize = 5, linewidth = 2,
                       label = Printf.@sprintf("tol = %.0e", tol))
     end
@@ -178,7 +180,7 @@ function fig_accuracy()
     Ls = (256, 512, 1024)
     tols = (1e-4, 1e-6, 1e-8, 1e-10)
     for L in Ls, tol in tols
-        @assert PF.try_stretch_geometry(0.0, θstar, L, tol) !== nothing "(lmax=$L, tol=$tol) inadmissible"
+        @assert PartialFSHT.try_stretch_geometry(0.0, θstar, L, tol) !== nothing "(lmax=$L, tol=$tol) inadmissible"
     end
 
     fig = CairoMakie.Figure(size = (560, 380))
@@ -191,16 +193,16 @@ function fig_accuracy()
     CairoMakie.text!(ax, 3e-9, 3e-12; text = "below the line: delivered better than requested",
           fontsize = 9, align = (:left, :center), color = :gray30)
     for (i, L) in enumerate(Ls)
-        pd = PF.Plan(θ, φ; lmax = L, method = PF.DirectAlgorithm())
-        alm = PF.zeros_alm(L)
+        pd = PartialFSHT.Plan(θ, φ; lmax = L, method = PartialFSHT.DirectAlgorithm())
+        alm = PartialFSHT.zeros_alm(L)
         for ℓ in 0:L, m in (-ℓ):ℓ
-            alm[PF.sph_mode(ℓ, m)] = randn(ComplexF64) / (1 + ℓ)
+            alm[PartialFSHT.sph_mode(ℓ, m)] = randn(ComplexF64) / (1 + ℓ)
         end
         fd = pd * alm
         errs = Float64[]
         for tol in tols
-            ps = PF.Plan(θ, φ; lmax = L, method = PF.StretchAlgorithm(), tol = tol,
-                         nufft = PF.DirectSumBackend())
+            ps = PartialFSHT.Plan(θ, φ; lmax = L, method = PartialFSHT.StretchAlgorithm(), tol = tol,
+                         nufft = PartialFSHT.DirectSumBackend())
             fs = ps * alm
             push!(errs, maximum(abs.(fs .- fd)) / maximum(abs.(fd)))
         end
@@ -230,16 +232,16 @@ function fig_work()
         w = Float64[]
         for d in degs
             θstar = d * π / 180
-            geom = PF.try_stretch_geometry(0.0, θstar, L, 1e-8)
+            geom = PartialFSHT.try_stretch_geometry(0.0, θstar, L, 1e-8)
             if geom === nothing
                 push!(w, NaN)
                 continue
             end
-            nθ_half = PF.next_smooth(geom.K + 3)
-            θr, _ = PF.stretch_rings(geom, nθ_half)
-            push!(w, float(first(PF.counted_ring_work(θr, L, 1e-8))))
+            nθ_half = PartialFSHT.next_smooth(geom.K + 3)
+            θr, _ = PartialFSHT.stretch_rings(geom, nθ_half)
+            push!(w, float(first(PartialFSHT.counted_ring_work(θr, L, 1e-8))))
         end
-        full = float(first(PF.counted_ring_work(collect(range(1e-6, π - 1e-6;
+        full = float(first(PartialFSHT.counted_ring_work(collect(range(1e-6, π - 1e-6;
                                                              length = L + 1)), L, 1e-8)))
         CairoMakie.lines!(ax1, degs, w; color = PALETTE[i], linewidth = 2, label = "lmax = $L")
         CairoMakie.hlines!(ax1, [full]; color = PALETTE[i], linestyle = :dot, linewidth = 1)

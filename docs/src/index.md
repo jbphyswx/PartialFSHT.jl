@@ -1,3 +1,7 @@
+```@meta
+CurrentModule = PartialFSHT
+```
+
 # PartialFSHT.jl
 
 Partial-sky spherical harmonic transforms: the operator

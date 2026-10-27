@@ -1,13 +1,10 @@
-using Documenter
-using PartialFSHT
+using Documenter: Documenter
+using PartialFSHT: PartialFSHT
 
-# Figures are computed from the package, so they cannot drift from the behaviour they illustrate.
-# Set PARTIALFSHT_SKIP_FIGURES=1 to reuse whatever is already in `src/assets`.
-if get(ENV, "PARTIALFSHT_SKIP_FIGURES", "0") != "1"
-    include(joinpath(@__DIR__, "make_figures.jl"))
-end
+# Figures are committed in src/assets. Regenerate them explicitly with the separate
+# docs/generate_assets environment; see docs/README.md.
 
-makedocs(;
+Documenter.makedocs(;
     modules = [PartialFSHT],
     sitename = "PartialFSHT.jl",
     format = Documenter.HTML(;
@@ -27,7 +24,7 @@ makedocs(;
     warnonly = [:missing_docs, :docs_block],
 )
 
-deploydocs(;
+Documenter.deploydocs(;
     repo = "github.com/jbphyswx/PartialFSHT.jl",
     target = "build",
     branch = "gh-pages",
